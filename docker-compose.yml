@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: sitepulse-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sitepulse
+      POSTGRES_PASSWORD: sitepulse_dev
+      POSTGRES_DB: sitepulse
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sitepulse -d sitepulse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: sitepulse-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    # AOF helps preserve unconsumed queue messages across Redis restarts.
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:
