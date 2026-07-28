@@ -78,3 +78,16 @@ python -m pytest -q
 ```
 
 Tests use mocked HTTP transports and do not access the public internet.
+
+API integration tests use the configured PostgreSQL database, mock Celery
+dispatch, and clean up the jobs they create through public API endpoints.
+
+## Reliability and security
+
+- Send `Idempotency-Key` with uploads to make client retries safe.
+- Workers use advisory locks, late acknowledgement, Redis redelivery, and
+  queued-row resumption.
+- Transient infrastructure failures retry with exponential backoff.
+- Uploads, URLs, redirects, and response bodies have explicit limits.
+- DNS-resolved private and reserved IPv4/IPv6 destinations are rejected.
+- Redis limits job creation to 10 requests per IP per minute by default.

@@ -25,6 +25,7 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     # Docker startup order is not guaranteed, so workers keep waiting for Redis.
     broker_connection_retry_on_startup=True,
+    broker_transport_options={"visibility_timeout": 3600},
     worker_hijack_root_logger=False,
     timezone="UTC",
 )

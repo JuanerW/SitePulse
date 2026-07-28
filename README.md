@@ -1,10 +1,12 @@
 # SitePulse
 
+[![CI](https://github.com/JuanerW/SitePulse/actions/workflows/ci.yml/badge.svg)](https://github.com/JuanerW/SitePulse/actions/workflows/ci.yml)
+
 SitePulse is a full-stack website health monitoring platform. Upload a CSV of
 URLs, process checks asynchronously, follow live progress, inspect actionable
 failure categories, retry selected results, and export the final report.
 
-Current version: **0.4.1 — Correlated JSON Logging**
+Current version: **0.5.0 — Engineering Quality**
 
 ## Architecture
 
@@ -15,7 +17,7 @@ Current version: **0.4.1 — Correlated JSON Logging**
 | Queue | Redis | Delivers job messages from the API to workers |
 | Worker | Celery | Checks URLs concurrently and persists progress |
 | Database | PostgreSQL | Stores jobs and individual URL results |
-| Local runtime | Docker Compose | Runs PostgreSQL and Redis |
+| Local runtime | Docker Compose | Runs migrations and the complete six-service stack |
 
 ```text
 React ──POST──> FastAPI ──write──> PostgreSQL
@@ -119,6 +121,51 @@ This makes one upload traceable across the API, Redis queue, and Celery worker.
 Logs intentionally contain IDs, counts, statuses, and timings rather than CSV
 contents or response bodies.
 
+## Reliability
+
+### Idempotent uploads
+
+Clients may send an `Idempotency-Key` header with `POST /api/checks`. Replaying
+the same key and CSV returns the original job without sending duplicate Celery
+work. Reusing the key with different content returns `409 Conflict`. A unique
+PostgreSQL index resolves concurrent submissions atomically.
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/api/checks `
+  -H "Idempotency-Key: upload-2026-07-28-001" `
+  -F "file=@backend/sample-websites.csv"
+```
+
+### Worker recovery
+
+- Celery acknowledges messages only after execution.
+- Lost-worker messages are rejected and become eligible for redelivery.
+- Redis retains unacknowledged messages for a one-hour visibility window.
+- PostgreSQL advisory locks allow only one worker to process a job at a time.
+- Redelivered jobs process only rows still marked `queued`.
+- Transient database and operating-system failures retry with exponential
+  backoff; deterministic application failures fail immediately.
+
+Together these rules provide at-least-once delivery without duplicate progress
+counts and allow a replacement worker to resume after a crash.
+
+## Security and resource controls
+
+- CSV upload size: 1 MB
+- URLs per job: 200
+- URL length: 2,048 characters
+- Downloaded response body: 1 MB
+- Redirects: 5
+- Create-job rate: 10 requests per client IP per minute
+- URL schemes: HTTP and HTTPS only
+- URL credentials are rejected
+- Literal and DNS-resolved private, loopback, link-local, multicast, and
+  reserved IPv4/IPv6 destinations are rejected
+- Every redirect target is validated and resolved again before following it
+
+The rate limiter is stored in Redis and returns `429` with `Retry-After`.
+Limits are configurable through environment variables.
+
 ## Local development
 
 Requirements: Python 3.11+, Node.js 20+, Docker Desktop.
@@ -130,7 +177,28 @@ cd backend
 python -m pip install -r requirements.txt
 ```
 
-Start PostgreSQL and Redis from the repository root:
+### One-command Docker startup
+
+Build and start the complete application:
+
+```powershell
+docker compose up --build
+```
+
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Compose starts:
+
+```text
+postgres → migrate → api
+redis ─────────────→ api + worker
+api ───────────────→ frontend
+```
+
+The `migrate` container must complete successfully before the API and worker
+start. PostgreSQL and Redis use persistent named volumes.
+
+### Manual development
+
+Start PostgreSQL and Redis:
 
 ```powershell
 docker compose up -d
@@ -191,9 +259,18 @@ cd frontend
 npm run build
 ```
 
-The current backend baseline is **23 passing tests**, covering CSV parsing,
-deduplication, URL validation, basic SSRF protection, response classification,
-timeouts, network errors, and HTML title extraction.
+The current backend baseline is **31 passing tests**, covering CSV parsing,
+deduplication, API and PostgreSQL integration, idempotency, request IDs,
+rate limiting, URL and DNS/IP SSRF defenses, size limits, response
+classification, network failures, and HTML title extraction.
+
+GitHub Actions runs:
+
+- PostgreSQL and Redis service containers
+- Alembic upgrade and model drift detection
+- Backend tests
+- Frontend lint, type-check, and production build
+- Docker Compose validation and image builds
 
 Sample inputs:
 
@@ -214,16 +291,35 @@ automated traffic even when they remain accessible in a browser.
 
 ## Roadmap
 
-- API and worker integration tests
-- Stronger idempotency and worker crash recovery
-- Complete DNS/IP and redirect-aware SSRF protection
-- Upload and response body size limits
-- API rate limiting
-- GitHub Actions CI
-- One-command Docker Compose startup for the complete stack
 - Public deployment and performance benchmarks
+- Authentication and per-user job isolation
+- SSE or WebSocket progress updates
 
 ## Version history
+
+### 0.5.0 — 2026-07-28
+
+Added:
+
+- PostgreSQL-backed API integration tests covering the complete job lifecycle.
+- `Idempotency-Key` support with payload fingerprints and a unique DB index.
+- PostgreSQL advisory locks for single-worker job ownership and crash recovery.
+- Classified Celery retries with exponential backoff.
+- Redis redelivery and visibility-timeout configuration.
+- CSV, URL, response body, and redirect limits.
+- DNS/IP and redirect-aware SSRF validation for IPv4 and IPv6.
+- Redis-backed create-job rate limiting with standard response headers.
+- GitHub Actions jobs for backend, frontend, and Compose verification.
+- Production Dockerfiles, Nginx routing, migration container, and complete
+  six-service Docker Compose startup.
+- Eight additional tests, bringing the backend baseline to 31.
+
+Changed:
+
+- React now supports `VITE_API_URL` and uses the Nginx `/api` proxy in Docker.
+- Website responses are streamed and stopped at the configured byte limit.
+- Worker redelivery resumes only queued result rows.
+- README now documents every reliability, security, CI, and deployment control.
 
 ### 0.4.1 — 2026-07-28
 
@@ -276,6 +372,7 @@ Changed:
 
 - The dashboard polls instead of using SSE or WebSockets.
 - Progress is committed once per URL; larger workloads should batch writes.
-- SSRF protection is currently basic and does not fully pin DNS resolutions.
+- DNS targets are validated immediately before each request, but hardened
+  production deployments should also enforce outbound network policy.
 - Future schema changes must be added as Alembic revisions.
-- FastAPI, Celery, and React are not yet included in Docker Compose.
+- Rate limiting is IP-based; authenticated deployments should add per-user quotas.

@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import logging
 import math
@@ -10,6 +11,7 @@ from fastapi import (
     Depends,
     FastAPI,
     File,
+    Header,
     HTTPException,
     Query,
     UploadFile,
@@ -19,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -31,9 +34,12 @@ from observability import (
     configure_logging,
     current_request_id,
 )
+from rate_limit import enforce_create_job_rate_limit
 
 
 MAX_URLS = 200
+MAX_UPLOAD_BYTES = 1_000_000
+MAX_URL_LENGTH = 2048
 configure_logging()
 logger = logging.getLogger("sitepulse.api")
 
@@ -169,6 +175,11 @@ def read_urls_from_csv(content: bytes) -> list[str]:
             status_code=400,
             detail=f"A job can check at most {MAX_URLS} URLs",
         )
+    if any(len(url) > MAX_URL_LENGTH for url in urls):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Each URL must be at most {MAX_URL_LENGTH} characters",
+        )
 
     # Reject malformed or local URLs before creating a database job.
     for url in urls:
@@ -206,7 +217,13 @@ async def database_health_check() -> dict[str, str]:
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def create_check_job(
+    _: None = Depends(enforce_create_job_rate_limit),
     file: UploadFile = File(...),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+        max_length=128,
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> JobAccepted:
     """
@@ -221,9 +238,42 @@ async def create_check_job(
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a .csv file")
 
-    urls = read_urls_from_csv(await file.read())
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"CSV files must be at most {MAX_UPLOAD_BYTES} bytes",
+        )
+
+    fingerprint = hashlib.sha256(content).hexdigest()
+    normalized_key = idempotency_key.strip() if idempotency_key else None
+    if normalized_key:
+        existing_job = await db.scalar(
+            select(models.Job).where(
+                models.Job.idempotency_key == normalized_key
+            )
+        )
+        if existing_job:
+            if existing_job.request_fingerprint != fingerprint:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key was already used for a different file",
+                )
+            logger.info(
+                "idempotent_job_reused",
+                extra={"job_id": str(existing_job.id)},
+            )
+            return JobAccepted(
+                job_id=existing_job.id,
+                status=existing_job.status,
+                total_urls=existing_job.total_urls,
+            )
+
+    urls = read_urls_from_csv(content)
     job = models.Job(
         filename=file.filename,
+        idempotency_key=normalized_key,
+        request_fingerprint=fingerprint if normalized_key else None,
         status="queued",
         total_urls=len(urls),
         completed_urls=0,
@@ -235,7 +285,32 @@ async def create_check_job(
         ],
     )
     db.add(job)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        if not normalized_key:
+            raise
+        # A concurrent request may have inserted the same key after our first
+        # lookup. The unique index decides the winner atomically.
+        existing_job = await db.scalar(
+            select(models.Job).where(
+                models.Job.idempotency_key == normalized_key
+            )
+        )
+        if (
+            existing_job is None
+            or existing_job.request_fingerprint != fingerprint
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency-Key was already used for a different file",
+            )
+        return JobAccepted(
+            job_id=existing_job.id,
+            status=existing_job.status,
+            total_urls=existing_job.total_urls,
+        )
     await db.refresh(job)
 
     try:

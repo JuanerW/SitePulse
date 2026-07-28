@@ -3,7 +3,16 @@ import asyncio
 import httpx
 import pytest
 
+import checker
 from checker import check_one_website, classify_status, validate_url
+
+
+@pytest.fixture(autouse=True)
+def avoid_real_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def public_dns(_: str) -> set[str]:
+        return {"93.184.216.34"}
+
+    monkeypatch.setattr(checker, "resolve_public_addresses", public_dns)
 
 
 def test_validate_url_accepts_http_and_https() -> None:
@@ -17,7 +26,10 @@ def test_validate_url_accepts_http_and_https() -> None:
         ("ftp://example.com", "http://"),
         ("not-a-url", "http://"),
         ("http://localhost:8000", "Local addresses"),
-        ("http://127.0.0.1", "Local addresses"),
+        ("http://127.0.0.1", "Private"),
+        ("http://10.0.0.1", "Private"),
+        ("http://169.254.169.254/latest/meta-data", "Private"),
+        ("http://user:password@example.com", "credentials"),
     ],
 )
 def test_validate_url_rejects_invalid_or_local_addresses(
@@ -91,3 +103,19 @@ async def test_check_one_website_keeps_http_error_as_result() -> None:
     assert result.status == "not_found"
     assert result.status_code == 404
     assert result.error == "HTTP 404"
+
+
+@pytest.mark.anyio
+async def test_check_rejects_oversized_response() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-length": str(checker.MAX_RESPONSE_BYTES + 1)},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await check_one_website(
+            client, asyncio.Semaphore(1), "https://example.com"
+        )
+
+    assert result.status == "response_too_large"

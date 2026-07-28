@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
 import './App.css'
 
-const API_URL = 'http://127.0.0.1:8000'
+const API_URL =
+  import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
 const POLL_INTERVAL_MS = 1000
 const PAGE_SIZE = 8
 
@@ -16,6 +17,7 @@ type ResultStatus =
   | 'client_error'
   | 'timeout'
   | 'network_error'
+  | 'response_too_large'
 
 type CheckResult = {
   id: number
@@ -82,6 +84,7 @@ const STATUS_LABELS: Record<string, string> = {
   client_error: 'Client error',
   timeout: 'Timeout',
   network_error: 'Network error',
+  response_too_large: 'Response too large',
 }
 
 function statusLabel(status: string) {
@@ -742,6 +745,7 @@ function App() {
               <option value="server_error">Server error</option>
               <option value="timeout">Timeout</option>
               <option value="network_error">Network error</option>
+              <option value="response_too_large">Response too large</option>
               <option value="queued">Queued</option>
             </select>
             <select

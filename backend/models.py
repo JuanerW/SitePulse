@@ -19,6 +19,12 @@ class Job(Base):
         default=uuid.uuid4,
     )
     filename: Mapped[str] = mapped_column(String(255))
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(128), unique=True, index=True, nullable=True
+    )
+    request_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(20), default="queued")
     total_urls: Mapped[int] = mapped_column(Integer)
     completed_urls: Mapped[int] = mapped_column(

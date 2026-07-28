@@ -1,7 +1,6 @@
 services:
   postgres:
     image: postgres:17
-    container_name: sitepulse-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: sitepulse
@@ -19,11 +18,9 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: sitepulse-redis
     restart: unless-stopped
     ports:
       - "6379:6379"
-    # AOF helps preserve unconsumed queue messages across Redis restarts.
     command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
@@ -32,6 +29,64 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  migrate:
+    build: ./backend
+    command: python -m alembic upgrade head
+    environment: &backend-environment
+      DATABASE_URL: postgresql+asyncpg://sitepulse:sitepulse_dev@postgres:5432/sitepulse
+      REDIS_URL: redis://redis:6379/0
+      CREATE_JOB_RATE_LIMIT: "10"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    environment: *backend-environment
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build: ./backend
+    command: celery -A celery_app worker --loglevel=info
+    restart: unless-stopped
+    environment: *backend-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ""
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   postgres_data:

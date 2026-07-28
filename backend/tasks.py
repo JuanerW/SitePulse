@@ -5,7 +5,8 @@ import uuid
 from datetime import datetime, timezone
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
@@ -41,6 +42,19 @@ async def process_job(job_id: uuid.UUID) -> None:
 
     try:
         async with session_factory() as session:
+            lock_acquired = bool(
+                await session.scalar(
+                    text(
+                        "SELECT pg_try_advisory_lock("
+                        "hashtextextended(CAST(:job_id AS text), 0))"
+                    ),
+                    {"job_id": str(job_id)},
+                )
+            )
+            if not lock_acquired:
+                logger.info("job_skipped_already_running")
+                return
+
             query = (
                 select(models.Job)
                 .options(selectinload(models.Job.results))
@@ -170,7 +184,7 @@ async def mark_job_failed(job_id: uuid.UUID, message: str) -> None:
 @celery_app.task(
     bind=True,
     name="sitepulse.check_job",
-    max_retries=2,
+    max_retries=4,
     default_retry_delay=5,
 )
 def check_job(self, job_id: str, request_id: str | None = None) -> None:
@@ -190,11 +204,20 @@ def check_job(self, job_id: str, request_id: str | None = None) -> None:
         )
         try:
             asyncio.run(process_job(parsed_job_id))
-        except Exception as exc:
+        except (DBAPIError, OSError) as exc:
             logger.exception(
-                "celery_task_failed",
+                "celery_task_transient_failure",
                 extra={"retry_number": self.request.retries},
             )
+            if self.request.retries >= self.max_retries:
+                asyncio.run(mark_job_failed(parsed_job_id, str(exc)))
+                raise
+            # Exponential backoff: 5, 10, 20, then 40 seconds.
+            raise self.retry(
+                exc=exc,
+                countdown=min(60, 5 * (2**self.request.retries)),
+            )
+        except Exception as exc:
+            logger.exception("celery_task_permanent_failure")
             asyncio.run(mark_job_failed(parsed_job_id, str(exc)))
-            # self.retry requeues the message; it fails permanently after max_retries.
-            raise self.retry(exc=exc)
+            raise
