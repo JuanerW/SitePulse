@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -16,12 +17,15 @@ from checker import (
     WebsiteCheck,
     check_one_website,
 )
+from observability import configure_logging, correlation_context
 
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql+asyncpg://sitepulse:sitepulse_dev@localhost:5432/sitepulse",
 )
+configure_logging()
+logger = logging.getLogger("sitepulse.worker")
 
 
 async def process_job(job_id: uuid.UUID) -> None:
@@ -46,9 +50,11 @@ async def process_job(job_id: uuid.UUID) -> None:
 
             if job is None:
                 # A message may reference a deleted job; no retry is needed.
+                logger.warning("job_not_found")
                 return
             if job.status in {"completed", "cancelled"}:
                 # Keep redelivery idempotent by skipping terminal jobs.
+                logger.info("job_skipped_terminal", extra={"job_status": job.status})
                 return
 
             job.status = "processing"
@@ -60,6 +66,10 @@ async def process_job(job_id: uuid.UUID) -> None:
             pending_records = [
                 record for record in job.results if record.status == "queued"
             ]
+            logger.info(
+                "job_processing_started",
+                extra={"url_count": len(pending_records)},
+            )
             records_by_id = {record.id: record for record in pending_records}
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
@@ -112,12 +122,30 @@ async def process_job(job_id: uuid.UUID) -> None:
 
                     # Commit after each URL so React can display live progress.
                     await session.commit()
+                    logger.info(
+                        "url_check_completed",
+                        extra={
+                            "result_id": record.id,
+                            "result_status": result.status,
+                            "status_code": result.status_code,
+                            "duration_ms": result.response_time_ms,
+                            "completed_urls": job.completed_urls,
+                            "total_urls": job.total_urls,
+                        },
+                    )
 
             await session.refresh(job, attribute_names=["status"])
             if job.status != "cancelled":
                 job.status = "completed"
                 job.finished_at = datetime.now(timezone.utc)
                 await session.commit()
+                logger.info(
+                    "job_completed",
+                    extra={
+                        "successful_urls": job.successful_urls,
+                        "failed_urls": job.failed_urls,
+                    },
+                )
     finally:
         await engine.dispose()
 
@@ -145,7 +173,7 @@ async def mark_job_failed(job_id: uuid.UUID, message: str) -> None:
     max_retries=2,
     default_retry_delay=5,
 )
-def check_job(self, job_id: str) -> None:
+def check_job(self, job_id: str, request_id: str | None = None) -> None:
     """
     Synchronous Celery entry point.
 
@@ -155,9 +183,18 @@ def check_job(self, job_id: str) -> None:
 
     parsed_job_id = uuid.UUID(job_id)
 
-    try:
-        asyncio.run(process_job(parsed_job_id))
-    except Exception as exc:
-        asyncio.run(mark_job_failed(parsed_job_id, str(exc)))
-        # self.retry requeues the message; it fails permanently after max_retries.
-        raise self.retry(exc=exc)
+    with correlation_context(request_id=request_id, job_id=job_id):
+        logger.info(
+            "celery_task_received",
+            extra={"celery_task_id": self.request.id},
+        )
+        try:
+            asyncio.run(process_job(parsed_job_id))
+        except Exception as exc:
+            logger.exception(
+                "celery_task_failed",
+                extra={"retry_number": self.request.retries},
+            )
+            asyncio.run(mark_job_failed(parsed_job_id, str(exc)))
+            # self.retry requeues the message; it fails permanently after max_retries.
+            raise self.retry(exc=exc)

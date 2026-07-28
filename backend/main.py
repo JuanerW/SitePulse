@@ -1,5 +1,6 @@
 import csv
 import io
+import logging
 import math
 import uuid
 from contextlib import asynccontextmanager
@@ -23,24 +24,29 @@ from sqlalchemy.orm import selectinload
 
 import models
 from checker import validate_url
-from database import Base, SessionFactory, engine, get_db
+from database import SessionFactory, engine, get_db
 from tasks import check_job
+from observability import (
+    RequestContextMiddleware,
+    configure_logging,
+    current_request_id,
+)
 
 
 MAX_URLS = 200
+configure_logging()
+logger = logging.getLogger("sitepulse.api")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """
-    Ensure a fresh database has all required tables at startup.
+    Release the shared database connection pool during graceful shutdown.
 
-    create_all only creates missing tables and never modifies existing schemas.
-    Existing databases use migrations/001_async_jobs.sql until Alembic is added.
+    Database schema changes are intentionally not applied here. Run
+    `alembic upgrade head` before starting the API so every schema change is
+    versioned, repeatable, and visible in deployment logs.
     """
-
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
     yield
     await engine.dispose()
 
@@ -48,9 +54,10 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="SitePulse API",
     description="Upload a CSV of URLs and check website status in the background.",
-    version="0.2.0",
+    version="0.4.1",
     lifespan=lifespan,
 )
+app.add_middleware(RequestContextMiddleware)
 
 # Allow both local origins used by the React development server.
 app.add_middleware(
@@ -233,7 +240,11 @@ async def create_check_job(
 
     try:
         # delay() sends a small message to Redis; it does not run the checks itself.
-        check_job.delay(str(job.id))
+        check_job.delay(str(job.id), current_request_id())
+        logger.info(
+            "job_enqueued",
+            extra={"job_id": str(job.id), "url_count": job.total_urls},
+        )
     except Exception as exc:
         # The row already exists, so mark it failed instead of leaving it queued forever.
         job.status = "failed"
@@ -390,7 +401,11 @@ async def retry_failed_results(
     await db.commit()
 
     try:
-        check_job.delay(str(job.id))
+        check_job.delay(str(job.id), current_request_id())
+        logger.info(
+            "job_retry_all_enqueued",
+            extra={"job_id": str(job.id), "url_count": len(retry_records)},
+        )
     except Exception as exc:
         job.status = "failed"
         job.error = "Could not send the retry job to Redis"
@@ -468,7 +483,11 @@ async def retry_selected_results(
     await db.commit()
 
     try:
-        check_job.delay(str(job.id))
+        check_job.delay(str(job.id), current_request_id())
+        logger.info(
+            "job_retry_selected_enqueued",
+            extra={"job_id": str(job.id), "url_count": retry_count},
+        )
     except Exception as exc:
         job.status = "failed"
         job.error = "Could not send the selected retry job to Redis"

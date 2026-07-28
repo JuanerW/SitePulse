@@ -16,6 +16,7 @@ Start the API:
 ```powershell
 cd backend
 python -m pip install -r requirements.txt
+python -m alembic upgrade head
 python -m uvicorn main:app --reload
 ```
 
@@ -28,6 +29,23 @@ celery -A celery_app worker --loglevel=info --pool=solo
 
 Open the API documentation at
 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
+
+## Correlation and logs
+
+The API returns `X-Request-ID` on every response. The same value is attached to
+Celery work created by that request, while `job_id` identifies the persistent
+background job. Both processes emit JSON logs to standard output.
+
+Useful events include:
+
+```text
+request_completed
+job_enqueued
+celery_task_received
+job_processing_started
+url_check_completed
+job_completed
+```
 
 ## Processing flow
 

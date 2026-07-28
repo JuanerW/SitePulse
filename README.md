@@ -4,7 +4,7 @@ SitePulse is a full-stack website health monitoring platform. Upload a CSV of
 URLs, process checks asynchronously, follow live progress, inspect actionable
 failure categories, retry selected results, and export the final report.
 
-Current version: **0.3.1 — Selective Retry**
+Current version: **0.4.1 — Correlated JSON Logging**
 
 ## Architecture
 
@@ -93,6 +93,32 @@ queued
 Interactive API documentation is available at
 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
 
+## Observability
+
+Every HTTP response includes an `X-Request-ID`. Clients may supply this header;
+otherwise the API generates a UUID. When an API request creates or retries a
+job, its request ID is propagated through the Celery message.
+
+FastAPI and Celery emit one JSON object per log line:
+
+```json
+{
+  "timestamp": "2026-07-28T12:00:00+00:00",
+  "level": "info",
+  "logger": "sitepulse.worker",
+  "event": "url_check_completed",
+  "request_id": "f62f...",
+  "job_id": "9104...",
+  "result_id": 42,
+  "result_status": "healthy",
+  "duration_ms": 184
+}
+```
+
+This makes one upload traceable across the API, Redis queue, and Celery worker.
+Logs intentionally contain IDs, counts, statuses, and timings rather than CSV
+contents or response bodies.
+
 ## Local development
 
 Requirements: Python 3.11+, Node.js 20+, Docker Desktop.
@@ -110,6 +136,17 @@ Start PostgreSQL and Redis from the repository root:
 docker compose up -d
 docker compose ps
 ```
+
+Apply database migrations:
+
+```powershell
+cd backend
+python -m alembic upgrade head
+```
+
+The baseline migration creates a fresh schema and can safely adopt databases
+created by SitePulse versions before `0.4.0`. Use `python -m alembic current`
+to inspect the installed revision.
 
 Start FastAPI:
 
@@ -154,7 +191,7 @@ cd frontend
 npm run build
 ```
 
-The current backend baseline is **20 passing tests**, covering CSV parsing,
+The current backend baseline is **23 passing tests**, covering CSV parsing,
 deduplication, URL validation, basic SSRF protection, response classification,
 timeouts, network errors, and HTML title extraction.
 
@@ -177,8 +214,6 @@ automated traffic even when they remain accessible in a browser.
 
 ## Roadmap
 
-- Alembic database migrations
-- Structured logging with request and job correlation IDs
 - API and worker integration tests
 - Stronger idempotency and worker crash recovery
 - Complete DNS/IP and redirect-aware SSRF protection
@@ -189,6 +224,29 @@ automated traffic even when they remain accessible in a browser.
 - Public deployment and performance benchmarks
 
 ## Version history
+
+### 0.4.1 — 2026-07-28
+
+Added:
+
+- Shared `observability.py` module with JSON formatting and correlation context.
+- `X-Request-ID` generation, propagation, and response headers.
+- Request ID propagation from FastAPI into Celery task messages.
+- Structured API request, job lifecycle, retry, and URL completion events.
+- Three observability tests; the backend baseline is now 23 tests.
+
+Changed:
+
+- FastAPI and Celery now use the same machine-readable logging format.
+- Celery tasks accept an optional request ID while remaining compatible with
+  previously queued one-argument messages.
+
+### 0.4.0 — 2026-07-28
+
+- Replaced startup-time `create_all` and handwritten SQL with Alembic.
+- Added an asynchronous migration environment using `DATABASE_URL`.
+- Added a compatibility-aware baseline for fresh and existing databases.
+- Verified both adoption and clean-database upgrade paths.
 
 ### 0.3.1 — 2026-07-28
 
@@ -219,5 +277,5 @@ automated traffic even when they remain accessible in a browser.
 - The dashboard polls instead of using SSE or WebSockets.
 - Progress is committed once per URL; larger workloads should batch writes.
 - SSRF protection is currently basic and does not fully pin DNS resolutions.
-- Database migrations are still handwritten SQL.
+- Future schema changes must be added as Alembic revisions.
 - FastAPI, Celery, and React are not yet included in Docker Compose.
