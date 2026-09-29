@@ -1,0 +1,83 @@
+# Production compose for the Oracle host (sitepulse.hanyuuu.com).
+# PostgreSQL is the 1Panel-managed container on `1panel-network`; Redis stays
+# private to this stack; only the frontend (nginx, proxies /api → api) is
+# published, on loopback, for OpenResty to reverse-proxy.
+#
+# Secrets live in a gitignored .env next to this file (see backend/.env.example
+# for the expected keys) — nothing in this compose file is a credential.
+#
+#   sudo docker compose -f docker-compose.prod.yml up -d --build
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: sitepulse-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build: ./backend
+    image: sitepulse-backend:latest
+    container_name: sitepulse-migrate
+    command: python -m alembic upgrade head
+    env_file: .env
+    networks: [default, 1panel-network]
+    restart: "no"
+
+  api:
+    image: sitepulse-backend:latest
+    container_name: sitepulse-api
+    restart: unless-stopped
+    env_file: .env
+    networks: [default, 1panel-network]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    image: sitepulse-backend:latest
+    container_name: sitepulse-worker
+    command: celery -A celery_app worker --loglevel=info --concurrency=2
+    restart: unless-stopped
+    env_file: .env
+    networks: [default, 1panel-network]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ""
+    image: sitepulse-frontend:latest
+    container_name: sitepulse-web
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3003:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+networks:
+  1panel-network:
+    external: true
+
+volumes:
+  redis_data:
