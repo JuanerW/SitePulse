@@ -561,8 +561,10 @@ function App() {
 
   const summary = useMemo(() => {
     if (!data) return null
+    // Only sites that answered: a timeout's duration is the deadline, not a
+    // response time, and would drag p95 and "slowest" to 8 s.
     const completedResults = data.results.filter(
-      (result) => result.response_time_ms !== null,
+      (result) => result.response_time_ms !== null && result.status_code !== null,
     )
     const times = completedResults
       .map((result) => result.response_time_ms ?? 0)

@@ -1066,3 +1066,14 @@ tbody tr.result-selected {
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
+
+@media (max-width: 640px) {
+  /* Let the results table scroll sideways instead of crushing the URL column. */
+  .table-wrapper table {
+    min-width: 760px;
+  }
+
+  .url-cell {
+    min-width: 240px;
+  }
+}
