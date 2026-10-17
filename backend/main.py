@@ -7,7 +7,7 @@ import math
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import (
     Depends,
@@ -25,7 +25,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -52,7 +52,7 @@ MAX_UPLOAD_BYTES = 1_000_000
 MAX_URL_LENGTH = 2048
 MAX_RETRIES_PER_JOB = 5
 JOB_RETENTION_HOURS = int(os.getenv("JOB_RETENTION_HOURS", "72"))
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.1"
 GIT_SHA = os.getenv("GIT_SHA", "dev")
 configure_logging()
 logger = logging.getLogger("sitepulse.api")
@@ -152,6 +152,8 @@ class JobDetail(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     heartbeat_at: datetime | None = None
+    # Computed here so a visitor's wrong clock cannot fake a dead worker.
+    heartbeat_age_seconds: float | None = None
     retry_count: int = 0
     # Whether the caller's owner token matches; only owners see job actions.
     is_owner: bool = False
@@ -192,20 +194,6 @@ def require_owner(job: models.Job, owner_hash: str | None) -> None:
             status_code=403,
             detail="Only the browser that started this job can change it",
         )
-
-
-async def delete_expired_jobs(db: AsyncSession) -> None:
-    """Keep the public demo small: drop finished jobs past the retention window."""
-
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=JOB_RETENTION_HOURS)
-    result = await db.execute(
-        delete(models.Job).where(
-            models.Job.created_at < cutoff,
-            models.Job.status.in_(["completed", "failed", "cancelled"]),
-        )
-    )
-    if result.rowcount:
-        logger.info("expired_jobs_deleted", extra={"job_count": result.rowcount})
 
 
 def read_urls_from_csv(content: bytes) -> list[str]:
@@ -273,34 +261,40 @@ async def database_health_check() -> dict[str, str]:
     return {"status": "healthy", "database": str(database_name)}
 
 
-_worker_cache: dict[str, float | int] = {"checked_at": 0.0, "workers": 0}
+_system_cache: dict[str, object] = {"at": 0.0, "body": None}
+SYSTEM_CACHE_SECONDS = 5
 
 
 async def count_workers() -> int:
-    """Ping Celery workers at most every 10 s; the page polls this endpoint."""
-
     loop = asyncio.get_running_loop()
-    if loop.time() - _worker_cache["checked_at"] > 10:
-        try:
-            replies = await loop.run_in_executor(
-                None, lambda: celery_app.control.ping(timeout=0.5)
-            )
-            _worker_cache["workers"] = len(replies or [])
-        except Exception:
-            logger.exception("worker_ping_failed")
-            _worker_cache["workers"] = 0
-        _worker_cache["checked_at"] = loop.time()
-    return int(_worker_cache["workers"])
+    try:
+        replies = await loop.run_in_executor(
+            None, lambda: celery_app.control.ping(timeout=0.5)
+        )
+        return len(replies or [])
+    except Exception:
+        logger.exception("worker_ping_failed")
+        return 0
 
 
 @app.get("/api/system")
 async def system_status(db: AsyncSession = Depends(get_db)) -> dict[str, object]:
-    """Live numbers for the status strip: workers, queue depth, active jobs."""
+    """
+    Live numbers for the status strip, cached for 5 s across all visitors.
 
+    `queued` counts messages waiting in Redis; `in_flight` counts messages a
+    worker has taken but not acknowledged yet (acks are late, so a running
+    job stays here until it finishes).
+    """
+
+    loop = asyncio.get_running_loop()
+    if _system_cache["body"] and loop.time() - float(_system_cache["at"]) < SYSTEM_CACHE_SECONDS:
+        return _system_cache["body"]  # type: ignore[return-value]
     try:
-        queue_depth = int(await redis_client.llen("celery"))
+        queued = int(await redis_client.llen("celery"))
+        in_flight = int(await redis_client.hlen("unacked"))
     except Exception:
-        queue_depth = -1
+        queued, in_flight = -1, -1
     active_jobs = int(
         await db.scalar(
             select(func.count(models.Job.id)).where(
@@ -309,14 +303,17 @@ async def system_status(db: AsyncSession = Depends(get_db)) -> dict[str, object]
         )
         or 0
     )
-    return {
+    body: dict[str, object] = {
         "version": APP_VERSION,
         "commit": GIT_SHA,
         "workers": await count_workers(),
-        "queue_depth": queue_depth,
+        "queue_depth": queued,
+        "in_flight": in_flight,
         "active_jobs": active_jobs,
         "retention_hours": JOB_RETENTION_HOURS,
     }
+    _system_cache.update(at=loop.time(), body=body)
+    return body
 
 
 @app.post(
@@ -388,12 +385,12 @@ async def create_check_job(
 
     await enforce_create_job_rate_limit(request, response)
     urls = read_urls_from_csv(content)
-    await delete_expired_jobs(db)
     job = models.Job(
         filename=file.filename,
         idempotency_key=normalized_key,
         request_fingerprint=fingerprint if normalized_key else None,
         owner_hash=owner_hash,
+        request_id=current_request_id(),
         status="queued",
         total_urls=len(urls),
         completed_urls=0,
@@ -543,6 +540,11 @@ async def get_job(
         started_at=job.started_at,
         finished_at=job.finished_at,
         heartbeat_at=job.heartbeat_at,
+        heartbeat_age_seconds=(
+            round((datetime.now(timezone.utc) - job.heartbeat_at).total_seconds(), 1)
+            if job.heartbeat_at
+            else None
+        ),
         retry_count=job.retry_count,
         is_owner=(
             job.owner_hash is not None
@@ -851,7 +853,6 @@ async def export_job_csv(
 # without depending on third-party sites misbehaving on cue.
 DEMO_STATUS_CODES = {200, 403, 404, 429, 500, 503}
 DEMO_SLOW_SECONDS = 12  # longer than the checker's 8 s timeout
-demo_slow_slots = asyncio.Semaphore(20)
 
 
 @app.get("/api/demo/status/{code}", include_in_schema=False)
@@ -864,11 +865,10 @@ async def demo_status(code: int = PathParam(...)) -> PlainTextResponse:
 
 @app.get("/api/demo/slow", include_in_schema=False)
 async def demo_slow() -> PlainTextResponse:
-    # Bounded so the endpoint cannot be used to pin open API connections.
-    if demo_slow_slots.locked():
-        raise HTTPException(status_code=503, detail="Demo endpoint busy")
-    async with demo_slow_slots:
-        await asyncio.sleep(DEMO_SLOW_SECONDS)
+    # A sleeping coroutine costs almost nothing, so there is deliberately no
+    # slot limit: a cap would let anyone fill it and turn every visitor's
+    # "timeout" sample row into a 503.
+    await asyncio.sleep(DEMO_SLOW_SECONDS)
     return PlainTextResponse("SitePulse demo: slow response")
 
 
@@ -877,8 +877,9 @@ async def demo_redirect() -> RedirectResponse:
     return RedirectResponse("/api/demo/status/200", status_code=301)
 
 
-@app.get("/api/demo/redirect-to-metadata", include_in_schema=False)
-async def demo_redirect_to_metadata() -> RedirectResponse:
-    # A public URL that redirects into the cloud metadata range. The checker
-    # must refuse the second hop.
-    return RedirectResponse("http://169.254.169.254/latest/meta-data/", status_code=302)
+@app.get("/api/demo/redirect-to-private", include_in_schema=False)
+async def demo_redirect_to_private() -> RedirectResponse:
+    # A public URL whose redirect points into a private network. The checker
+    # must refuse the second hop. It deliberately does not point at the cloud
+    # metadata address, so this domain is not a ready-made SSRF helper.
+    return RedirectResponse("http://10.255.255.1/internal", status_code=302)

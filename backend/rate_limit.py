@@ -43,6 +43,23 @@ def client_ip(request: Request) -> str:
     return peer
 
 
+def rate_limit_subject(address: str) -> str:
+    """
+    IPv4 addresses count individually; IPv6 counts per /64.
+
+    One IPv6 subscriber usually gets a whole /64, so per-address buckets would
+    let a single visitor rotate through billions of fresh quotas.
+    """
+
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return address
+    if parsed.version == 6:
+        return str(ipaddress.ip_network(f"{parsed}/64", strict=False))
+    return str(parsed)
+
+
 async def enforce_rate_limit(
     request: Request,
     response: Response,
@@ -52,7 +69,7 @@ async def enforce_rate_limit(
     """Allow `limit` operations per client IP and minute in one bucket."""
 
     window = int(time.time() // WINDOW_SECONDS)
-    key = f"sitepulse:rate:{bucket}:{client_ip(request)}:{window}"
+    key = f"sitepulse:rate:{bucket}:{rate_limit_subject(client_ip(request))}:{window}"
 
     try:
         count = await redis_client.incr(key)

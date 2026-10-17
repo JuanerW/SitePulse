@@ -25,14 +25,18 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     # Docker startup order is not guaranteed, so workers keep waiting for Redis.
     broker_connection_retry_on_startup=True,
-    # An unacknowledged message from a worker that died without saying so
-    # (SIGKILL, OOM, host reboot) goes back to the queue once it is older than
-    # this. kombu only scans for such messages every ~100 s, so recovery takes
-    # between this and this + 100 s. A big job (200 URLs, 10 at a time, 8 s
-    # timeout) can outlive the window; its duplicate delivery then finds the
-    # advisory lock taken and checks back every 30 s instead of running twice.
+    # Backstop for a worker that dies without saying so (SIGKILL, OOM, host
+    # reboot): Redis requeues its unacknowledged message once it is older than
+    # this. It must exceed the longest legitimate job, or healthy jobs get
+    # delivered twice: 200 URLs, 10 at a time, each capped at 15 s, is 300 s.
+    # The fast path is the heartbeat reaper below, which notices in ~30 s.
     broker_transport_options={
-        "visibility_timeout": int(os.getenv("CELERY_VISIBILITY_TIMEOUT", "120")),
+        "visibility_timeout": int(os.getenv("CELERY_VISIBILITY_TIMEOUT", "360")),
+    },
+    # Run with `celery worker -B`; one worker on one host needs no separate beat.
+    beat_schedule={
+        "reap-stale-jobs": {"task": "sitepulse.reap_stale_jobs", "schedule": 15.0},
+        "cleanup-jobs": {"task": "sitepulse.cleanup_jobs", "schedule": 600.0},
     },
     worker_hijack_root_logger=False,
     timezone="UTC",

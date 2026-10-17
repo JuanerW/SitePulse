@@ -63,3 +63,11 @@ def test_client_ip_trusts_x_real_ip_only_from_private_proxy() -> None:
     assert direct.get("/ip", headers={"X-Real-IP": "203.0.113.9"}).json() == {
         "ip": "8.8.8.8"
     }
+
+
+def test_ipv6_visitors_share_a_bucket_per_slash_64() -> None:
+    a = rate_limit.rate_limit_subject("2001:db8:1:2::1")
+    b = rate_limit.rate_limit_subject("2001:db8:1:2:ffff::9")
+    assert a == b == "2001:db8:1:2::/64"
+    assert rate_limit.rate_limit_subject("2001:db8:1:3::1") != a
+    assert rate_limit.rate_limit_subject("203.0.113.9") == "203.0.113.9"

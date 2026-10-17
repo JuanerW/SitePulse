@@ -2,10 +2,10 @@ import asyncio
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import select, text
+from sqlalchemy import and_, delete, or_, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
@@ -27,11 +27,33 @@ DATABASE_URL = os.getenv(
 )
 configure_logging()
 logger = logging.getLogger("sitepulse.worker")
-LOCK_BUSY_RETRY_SECONDS = 30
+HEARTBEAT_SECONDS = 5
+# A processing job whose heartbeat is older than this has lost its worker.
+STALE_AFTER_SECONDS = 30
+JOB_RETENTION_HOURS = int(os.getenv("JOB_RETENTION_HOURS", "72"))
+# Jobs created without an owner token (plain curl, or rows from before
+# ownership existed) cannot be managed by anyone, so they go sooner.
+ORPHAN_RETENTION_HOURS = 1
 
 
-class JobLockBusy(Exception):
-    """Another worker holds this job's advisory lock right now."""
+async def beat_heartbeat(session_factory: async_sessionmaker, job_id: uuid.UUID) -> None:
+    """
+    Mark the job alive every few seconds while it runs.
+
+    Writing only when a URL finishes would look dead whenever ten slow URLs
+    are in flight together. This uses its own session because the main one
+    is busy with result rows.
+    """
+
+    while True:
+        async with session_factory() as session:
+            await session.execute(
+                update(models.Job)
+                .where(models.Job.id == job_id)
+                .values(heartbeat_at=datetime.now(timezone.utc))
+            )
+            await session.commit()
+        await asyncio.sleep(HEARTBEAT_SECONDS)
 
 
 async def process_job(job_id: uuid.UUID) -> None:
@@ -57,12 +79,11 @@ async def process_job(job_id: uuid.UUID) -> None:
                 )
             )
             if not lock_acquired:
-                # Redis redelivered the message while the first worker is still
-                # running (or its connection is not closed yet). Dropping this
-                # copy would lose the job if that worker then dies, so check
-                # back later instead.
-                logger.info("job_lock_busy")
-                raise JobLockBusy()
+                # A duplicate delivery while another worker runs the job. It is
+                # safe to drop: if that worker dies, its heartbeat stops and
+                # reap_stale_jobs queues the job again.
+                logger.info("job_skipped_already_running")
+                return
 
             query = (
                 select(models.Job)
@@ -85,6 +106,7 @@ async def process_job(job_id: uuid.UUID) -> None:
             job.heartbeat_at = datetime.now(timezone.utc)
             job.error = None
             await session.commit()
+            heartbeat = asyncio.create_task(beat_heartbeat(session_factory, job_id))
 
             # Only process queued rows so committed results survive worker crashes.
             pending_records = [
@@ -140,7 +162,6 @@ async def process_job(job_id: uuid.UUID) -> None:
                     record.final_url = result.final_url
                     record.remote_ip = result.remote_ip
                     record.redirect_count = result.redirect_count
-                    job.heartbeat_at = datetime.now(timezone.utc)
 
                     job.completed_urls += 1
                     if result.status == "healthy":
@@ -162,6 +183,8 @@ async def process_job(job_id: uuid.UUID) -> None:
                         },
                     )
 
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
             await session.refresh(job, attribute_names=["status"])
             if job.status != "cancelled":
                 job.status = "completed"
@@ -218,14 +241,6 @@ def check_job(self, job_id: str, request_id: str | None = None) -> None:
         )
         try:
             asyncio.run(process_job(parsed_job_id))
-        except JobLockBusy as exc:
-            # Not a failure: if the other worker finishes, the next attempt
-            # sees a terminal job and stops; if it died, the lock is free.
-            raise self.retry(
-                exc=exc,
-                countdown=LOCK_BUSY_RETRY_SECONDS,
-                max_retries=40,
-            )
         except (DBAPIError, OSError) as exc:
             logger.exception(
                 "celery_task_transient_failure",
@@ -243,3 +258,79 @@ def check_job(self, job_id: str, request_id: str | None = None) -> None:
             logger.exception("celery_task_permanent_failure")
             asyncio.run(mark_job_failed(parsed_job_id, str(exc)))
             raise
+
+
+async def requeue_stale_jobs() -> list[tuple[uuid.UUID, str | None]]:
+    """Find processing jobs whose worker stopped sending heartbeats."""
+
+    engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=STALE_AFTER_SECONDS)
+    try:
+        async with session_factory() as session:
+            stale = (
+                await session.execute(
+                    select(models.Job.id, models.Job.request_id).where(
+                        models.Job.status == "processing",
+                        or_(
+                            models.Job.heartbeat_at.is_(None),
+                            models.Job.heartbeat_at < cutoff,
+                        ),
+                    )
+                )
+            ).all()
+            return [(row.id, row.request_id) for row in stale]
+    finally:
+        await engine.dispose()
+
+
+async def delete_expired_jobs() -> int:
+    """Apply the retention window on a timer, not only when traffic arrives."""
+
+    engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+    try:
+        async with session_factory() as session:
+            result = await session.execute(
+                delete(models.Job).where(
+                    or_(
+                        models.Job.created_at < now - timedelta(hours=JOB_RETENTION_HOURS),
+                        and_(
+                            models.Job.owner_hash.is_(None),
+                            models.Job.created_at
+                            < now - timedelta(hours=ORPHAN_RETENTION_HOURS),
+                            models.Job.status.notin_(["queued", "processing"]),
+                        ),
+                    )
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="sitepulse.reap_stale_jobs")
+def reap_stale_jobs() -> None:
+    """
+    Requeue jobs whose worker died mid-run.
+
+    Redis would redeliver the unacknowledged message on its own, but only after
+    the visibility timeout plus kombu's ~100 s scan interval. The heartbeat
+    makes a dead worker visible in about 30 s. Requeueing is safe: the advisory
+    lock stops a second copy from running while the first is alive, and only
+    rows still marked queued are checked.
+    """
+
+    for job_id, request_id in asyncio.run(requeue_stale_jobs()):
+        with correlation_context(request_id=request_id, job_id=str(job_id)):
+            logger.warning("stale_job_requeued")
+        check_job.delay(str(job_id), request_id)
+
+
+@celery_app.task(name="sitepulse.cleanup_jobs")
+def cleanup_jobs() -> None:
+    deleted = asyncio.run(delete_expired_jobs())
+    if deleted:
+        logger.info("expired_jobs_deleted", extra={"job_count": deleted})

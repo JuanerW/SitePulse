@@ -54,7 +54,7 @@ services:
   worker:
     image: sitepulse-backend:latest
     container_name: sitepulse-worker
-    command: celery -A celery_app worker --loglevel=info --concurrency=2
+    command: celery -A celery_app worker -B --schedule /tmp/celerybeat-schedule --loglevel=info --concurrency=2
     restart: unless-stopped
     env_file: .env
     networks: [default, 1panel-network]

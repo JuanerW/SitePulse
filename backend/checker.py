@@ -2,6 +2,8 @@ import asyncio
 import ipaddress
 import socket
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
@@ -10,6 +12,7 @@ import httpx
 
 
 REQUEST_TIMEOUT_SECONDS = 8.0
+TOTAL_DEADLINE_SECONDS = 15.0
 MAX_CONCURRENT_CHECKS = 10
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_REDIRECTS = 5
@@ -152,6 +155,42 @@ def pinned_request(url: str, address: str) -> tuple[str, dict[str, str], dict]:
     return target, headers, extensions
 
 
+@asynccontextmanager
+async def pinned_stream(
+    client: httpx.AsyncClient,
+    url: str,
+    addresses: list[str],
+) -> AsyncIterator[tuple[str, httpx.Response]]:
+    """
+    Stream a GET from the first validated address that accepts a connection.
+
+    IPv4 goes first: many container networks have no IPv6 route, and a name
+    with both record types would otherwise fail on the AAAA answer alone.
+    Only connection failures move on to the next address; a timeout or an
+    HTTP error is the site's answer and is reported as-is.
+    """
+
+    ordered = sorted(addresses, key=lambda address: ":" in address)
+    last_error: httpx.ConnectError | None = None
+    for address in ordered:
+        target, headers, extensions = pinned_request(url, address)
+        request = client.build_request(
+            "GET", target, headers=headers, extensions=extensions
+        )
+        try:
+            response = await client.send(request, stream=True, follow_redirects=False)
+        except httpx.ConnectError as exc:
+            last_error = exc
+            continue
+        try:
+            yield address, response
+        finally:
+            await response.aclose()
+        return
+    assert last_error is not None
+    raise last_error
+
+
 async def check_one_website(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
@@ -166,69 +205,78 @@ async def check_one_website(
     except ValueError as exc:
         return WebsiteCheck(url=raw_url, status="network_error", error=str(exc))
 
+    # Kept outside the try so failed checks still report how far they got.
+    current_url = url
+    remote_ip: str | None = None
+    redirect_count = 0
+    started_at = time.perf_counter()
+
+    def outcome(status: str, error: str | None = None, **fields: object) -> WebsiteCheck:
+        return WebsiteCheck(
+            url=url,
+            status=status,
+            error=error,
+            final_url=current_url,
+            remote_ip=remote_ip,
+            redirect_count=redirect_count,
+            **fields,  # type: ignore[arg-type]
+        )
+
+    def elapsed_ms() -> int:
+        return round((time.perf_counter() - started_at) * 1000)
+
     try:
         async with semaphore:
             started_at = time.perf_counter()
             response: httpx.Response | None = None
             body = b""
-            current_url = url
-            remote_ip: str | None = None
-            redirect_count = 0
-            for redirect_number in range(MAX_REDIRECTS + 1):
-                remote_ip = (await resolve_public_addresses(current_url))[0]
-                target, headers, extensions = pinned_request(current_url, remote_ip)
-                async with client.stream(
-                    "GET",
-                    target,
-                    headers=headers,
-                    extensions=extensions,
-                    follow_redirects=False,
-                ) as streamed_response:
-                    response = streamed_response
-                    if response.is_redirect:
-                        location = response.headers.get("location")
-                        if not location:
-                            break
-                        if redirect_number == MAX_REDIRECTS:
-                            raise httpx.TooManyRedirects(
-                                "Maximum redirect count exceeded",
-                                request=response.request,
-                            )
-                        # Join against the hostname URL, not the pinned IP URL.
-                        current_url = urljoin(current_url, location)
-                        validate_url(current_url)
-                        redirect_count += 1
-                        continue
+            # httpx's timeout applies per network operation, so a server that
+            # drips one byte every few seconds would never trip it. This caps
+            # the whole check, redirects included.
+            async with asyncio.timeout(TOTAL_DEADLINE_SECONDS):
+                for redirect_number in range(MAX_REDIRECTS + 1):
+                    addresses = await resolve_public_addresses(current_url)
+                    async with pinned_stream(client, current_url, addresses) as (
+                        connected_ip,
+                        streamed_response,
+                    ):
+                        remote_ip = connected_ip
+                        response = streamed_response
+                        if response.is_redirect:
+                            location = response.headers.get("location")
+                            if not location:
+                                break
+                            if redirect_number == MAX_REDIRECTS:
+                                raise httpx.TooManyRedirects(
+                                    "Maximum redirect count exceeded",
+                                    request=response.request,
+                                )
+                            # Join against the hostname URL, not the pinned IP URL.
+                            current_url = urljoin(current_url, location)
+                            redirect_count += 1
+                            validate_url(current_url)
+                            continue
 
-                    content_length = response.headers.get("content-length")
-                    if content_length and int(content_length) > MAX_RESPONSE_BYTES:
-                        return WebsiteCheck(
-                            url=url,
-                            status="response_too_large",
-                            status_code=response.status_code,
-                            error=f"Response exceeded {MAX_RESPONSE_BYTES} bytes",
-                            final_url=current_url,
-                            remote_ip=remote_ip,
-                            redirect_count=redirect_count,
-                        )
-                    chunks: list[bytes] = []
-                    received = 0
-                    async for chunk in response.aiter_bytes():
-                        received += len(chunk)
-                        if received > MAX_RESPONSE_BYTES:
-                            return WebsiteCheck(
-                                url=url,
-                                status="response_too_large",
+                        content_length = response.headers.get("content-length")
+                        if content_length and int(content_length) > MAX_RESPONSE_BYTES:
+                            return outcome(
+                                "response_too_large",
+                                f"Response exceeded {MAX_RESPONSE_BYTES} bytes",
                                 status_code=response.status_code,
-                                error=f"Response exceeded {MAX_RESPONSE_BYTES} bytes",
-                                final_url=current_url,
-                                remote_ip=remote_ip,
-                                redirect_count=redirect_count,
                             )
-                        chunks.append(chunk)
-                    body = b"".join(chunks)
-                    break
-        elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+                        chunks: list[bytes] = []
+                        received = 0
+                        async for chunk in response.aiter_bytes():
+                            received += len(chunk)
+                            if received > MAX_RESPONSE_BYTES:
+                                return outcome(
+                                    "response_too_large",
+                                    f"Response exceeded {MAX_RESPONSE_BYTES} bytes",
+                                    status_code=response.status_code,
+                                )
+                            chunks.append(chunk)
+                        body = b"".join(chunks)
+                        break
 
         assert response is not None
         parser = TitleParser()
@@ -236,27 +284,29 @@ async def check_one_website(
             parser.feed(body.decode(response.encoding or "utf-8", errors="replace"))
 
         result_status = classify_status(response.status_code)
-        return WebsiteCheck(
-            url=url,
-            status=result_status,
+        return outcome(
+            result_status,
+            None if result_status == "healthy" else f"HTTP {response.status_code}",
             status_code=response.status_code,
-            response_time_ms=elapsed_ms,
+            response_time_ms=elapsed_ms(),
             title=parser.title,
-            error=None if result_status == "healthy" else f"HTTP {response.status_code}",
-            final_url=current_url,
-            remote_ip=remote_ip,
-            redirect_count=redirect_count,
         )
-    except httpx.TimeoutException:
-        return WebsiteCheck(url=url, status="timeout", error="Request timed out")
+    except (httpx.TimeoutException, TimeoutError):
+        return outcome(
+            "timeout",
+            f"No complete answer after {elapsed_ms() / 1000:.1f} s",
+            response_time_ms=elapsed_ms(),
+        )
     except httpx.RequestError as exc:
-        return WebsiteCheck(
-            url=url,
-            status="network_error",
-            error=f"Network error: {exc}",
-        )
+        return outcome("network_error", f"Network error: {exc}")
     except UnsafeTargetError as exc:
         # Raised for the first hop or for any redirect target.
-        return WebsiteCheck(url=url, status="unsafe_target", error=str(exc))
+        if redirect_count:
+            host = urlparse(current_url).hostname
+            return outcome(
+                "unsafe_target",
+                f"Redirect {redirect_count} pointed at {host}, refused: {exc}",
+            )
+        return outcome("unsafe_target", str(exc))
     except ValueError as exc:
-        return WebsiteCheck(url=url, status="network_error", error=str(exc))
+        return outcome("network_error", str(exc))

@@ -166,6 +166,11 @@ async def test_redirect_to_private_address_is_unsafe_target() -> None:
 
     assert result.status == "unsafe_target"
     assert "Private" in (result.error or "")
+    # The row keeps the evidence: which hop, where it pointed, the last IP.
+    assert result.redirect_count == 1
+    assert result.final_url == "http://169.254.169.254/latest/meta-data"
+    assert result.remote_ip == "93.184.216.34"
+    assert "Redirect 1 pointed at 169.254.169.254" in (result.error or "")
 
 
 @pytest.mark.anyio
@@ -203,3 +208,57 @@ async def test_redirect_hops_and_final_url_are_recorded() -> None:
     assert result.status == "healthy"
     assert result.redirect_count == 1
     assert result.final_url == "https://example.com/new"
+
+
+@pytest.mark.anyio
+async def test_falls_back_to_next_address_when_connect_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable address (e.g. no IPv6 route) must not fail the check."""
+
+    async def two_addresses(_: str) -> list[str]:
+        return ["2606:2800:220:1::1", "93.184.216.34", "93.184.216.35"]
+
+    monkeypatch.setattr(checker, "resolve_public_addresses", two_addresses)
+    attempts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.host)
+        if request.url.host == "93.184.216.34":
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, text="ok")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await check_one_website(
+            client, asyncio.Semaphore(1), "https://example.com"
+        )
+
+    # IPv4 first, then the next IPv4; IPv6 is never needed here.
+    assert attempts == ["93.184.216.34", "93.184.216.35"]
+    assert result.status == "healthy"
+    assert result.remote_ip == "93.184.216.35"
+
+
+@pytest.mark.anyio
+async def test_total_deadline_stops_a_slow_drip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per-read timeouts never fire on a server that sends a byte now and then."""
+
+    monkeypatch.setattr(checker, "TOTAL_DEADLINE_SECONDS", 0.3)
+
+    class Drip(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.05)
+                yield b"x"
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=Drip())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await check_one_website(
+            client, asyncio.Semaphore(1), "https://example.com/drip"
+        )
+
+    assert result.status == "timeout"
+    assert result.remote_ip == "93.184.216.34"
+    assert result.response_time_ms is not None and result.response_time_ms >= 300

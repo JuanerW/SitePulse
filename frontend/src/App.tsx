@@ -14,8 +14,8 @@ import {
 const POLL_INTERVAL_MS = 1000
 const SYSTEM_POLL_MS = 10000
 const PAGE_SIZE = 8
-// The worker writes a heartbeat after every URL; checks time out after 8 s.
-const STALE_HEARTBEAT_MS = 25000
+// The worker writes a heartbeat every 5 s; the reaper requeues after 30 s.
+const STALE_HEARTBEAT_SECONDS = 15
 const MAX_URLS = 200
 
 type ResultStatus =
@@ -64,11 +64,10 @@ type JobDetail = {
   started_at?: string | null
   finished_at?: string | null
   heartbeat_at?: string | null
+  heartbeat_age_seconds?: number | null
   retry_count?: number
   is_owner: boolean
   results: CheckResult[]
-  // Set by the page when the response arrives, to judge heartbeat age.
-  fetched_at?: number
 }
 
 type SystemStatus = {
@@ -76,6 +75,7 @@ type SystemStatus = {
   commit: string
   workers: number
   queue_depth: number
+  in_flight: number
   active_jobs: number
   retention_hours: number
 }
@@ -241,7 +241,7 @@ function App() {
           throw new Error(await readError(response, 'Failed to load job details.'))
         }
 
-        const detail = { ...(await response.json()), fetched_at: Date.now() } as JobDetail
+        const detail = (await response.json()) as JobDetail
         setData(detail)
         setJobPage((current) => ({
           ...current,
@@ -659,10 +659,8 @@ function App() {
   const canCancel = data && isOwner && ['queued', 'processing'].includes(data.status)
   const canDelete = data && isOwner && TERMINAL_STATUSES.has(data.status)
   const heartbeatAge =
-    data?.status === 'processing' && data.heartbeat_at && data.fetched_at
-      ? data.fetched_at - new Date(data.heartbeat_at).getTime()
-      : 0
-  const workerQuiet = heartbeatAge > STALE_HEARTBEAT_MS
+    data?.status === 'processing' ? (data.heartbeat_age_seconds ?? 0) : 0
+  const workerQuiet = heartbeatAge > STALE_HEARTBEAT_SECONDS
   const showSubmission = submission && data?.job_id === submission.jobId
   const sampleCsvHref = useMemo(
     () =>
@@ -695,7 +693,7 @@ function App() {
           {systemDown
             ? 'API unreachable'
             : system
-              ? `${system.workers} ${system.workers === 1 ? 'worker' : 'workers'} · ${system.active_jobs} active ${system.active_jobs === 1 ? 'job' : 'jobs'} · ${system.queue_depth >= 0 ? `${system.queue_depth} queued` : 'queue unknown'}`
+              ? `${system.workers} ${system.workers === 1 ? 'worker' : 'workers'} · ${system.active_jobs} active ${system.active_jobs === 1 ? 'job' : 'jobs'} · ${system.queue_depth >= 0 ? `${system.queue_depth} queued · ${system.in_flight} running` : 'queue unknown'}`
               : 'Connecting…'}
           {system && <code className="status-version">v{system.version} · {system.commit}</code>}
         </span>
@@ -823,10 +821,10 @@ function App() {
             )}
             {workerQuiet && (
               <p className="worker-note">
-                No heartbeat for {Math.round(heartbeatAge / 1000)} s. The worker
-                probably died. Its message was never acknowledged, so Redis hands
-                it to another worker after the visibility timeout. That worker
-                skips the {data.completed} URLs already saved and checks the rest.
+                No heartbeat for {Math.round(heartbeatAge)} s, so the worker
+                probably died. Within about 30 s the reaper puts the job back on
+                the queue, and the next worker skips the {data.completed} URLs
+                already saved and checks the rest.
               </p>
             )}
             {!isOwner && (
@@ -1263,19 +1261,33 @@ function App() {
                         <dl className="detail-list">
                           <dt>Requested</dt>
                           <dd>{result.url}</dd>
-                          <dt>Final URL</dt>
+                          <dt>
+                            {result.status === 'unsafe_target' && result.redirect_count > 0
+                              ? 'Refused target'
+                              : 'Final URL'}
+                          </dt>
                           <dd>
                             {result.final_url ?? '—'}
                             {result.redirect_count > 0 &&
                               ` (after ${result.redirect_count} ${result.redirect_count === 1 ? 'redirect' : 'redirects'})`}
                           </dd>
-                          <dt>Connected to</dt>
+                          <dt>
+                            {result.status === 'unsafe_target' && result.redirect_count > 0
+                              ? 'Last public hop'
+                              : 'Connected to'}
+                          </dt>
                           <dd>
                             {result.remote_ip ??
                               (result.status === 'unsafe_target'
                                 ? 'Nothing. The address was refused before connecting.'
                                 : '—')}
                           </dd>
+                          {result.response_time_ms !== null && (
+                            <>
+                              <dt>Time</dt>
+                              <dd>{result.response_time_ms} ms</dd>
+                            </>
+                          )}
                           <dt>Detail</dt>
                           <dd>{result.error ?? result.title ?? '—'}</dd>
                         </dl>

@@ -65,6 +65,9 @@ class Job(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    # The X-Request-ID of the upload; reused when the reaper requeues the job
+    # so one grep still finds every log line for it.
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     retry_count: Mapped[int] = mapped_column(
         Integer,
         default=0,

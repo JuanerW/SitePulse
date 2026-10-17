@@ -1,7 +1,8 @@
-"""Duplicate deliveries must wait for the running worker, never run twice or vanish."""
+"""Crash recovery: duplicates never run twice, dead workers get their jobs back."""
 
 import asyncio
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -13,7 +14,7 @@ import tasks
 
 
 @pytest.mark.anyio
-async def test_duplicate_delivery_raises_lock_busy_while_job_is_locked() -> None:
+async def test_duplicate_delivery_is_skipped_while_job_is_locked() -> None:
     engine = create_async_engine(tasks.DATABASE_URL)
     job_id = uuid.uuid4()
     try:
@@ -22,32 +23,67 @@ async def test_duplicate_delivery_raises_lock_busy_while_job_is_locked() -> None
                 text("SELECT pg_advisory_lock(hashtextextended(CAST(:job_id AS text), 0))"),
                 {"job_id": str(job_id)},
             )
-            # The "first worker" holds the lock; a redelivered copy must not
-            # return quietly, or the job is lost if that worker dies later.
-            with pytest.raises(tasks.JobLockBusy):
+            # The "first worker" holds the lock; the copy must not run.
+            with patch.object(tasks, "check_one_website") as check:
                 await tasks.process_job(job_id)
+            check.assert_not_called()
     finally:
         await engine.dispose()
 
 
-def test_lock_busy_is_retried_later_not_failed() -> None:
-    def lock_busy(coroutine: object) -> None:
-        coroutine.close()  # type: ignore[attr-defined]
-        raise tasks.JobLockBusy()
+async def _insert_job(**fields) -> uuid.UUID:  # noqa: ANN003
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    class Retried(Exception):
-        pass
+    engine = create_async_engine(tasks.DATABASE_URL)
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            job = models.Job(filename="t.csv", total_urls=1, **fields)
+            session.add(job)
+            await session.commit()
+            return job.id
+    finally:
+        await engine.dispose()
 
-    with (
-        patch.object(tasks.asyncio, "run", side_effect=lock_busy),
-        patch.object(tasks.check_job, "retry", side_effect=Retried) as retry,
-        patch.object(tasks, "mark_job_failed") as mark_failed,
-    ):
-        with pytest.raises(Retried):
-            tasks.check_job.run(str(uuid.uuid4()))
 
-    assert retry.call_args.kwargs["countdown"] == tasks.LOCK_BUSY_RETRY_SECONDS
-    mark_failed.assert_not_called()
+async def _job_exists(job_id: uuid.UUID) -> bool:
+    engine = create_async_engine(tasks.DATABASE_URL)
+    try:
+        async with engine.connect() as connection:
+            found = await connection.scalar(
+                text("SELECT count(*) FROM jobs WHERE id = :id"), {"id": job_id}
+            )
+            return bool(found)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_reaper_finds_processing_jobs_with_a_stale_heartbeat() -> None:
+    now = datetime.now(timezone.utc)
+    stale = await _insert_job(status="processing", heartbeat_at=now - timedelta(seconds=90))
+    alive = await _insert_job(status="processing", heartbeat_at=now)
+    done = await _insert_job(status="completed", heartbeat_at=now - timedelta(hours=1))
+
+    found = [job_id for job_id, _ in await tasks.requeue_stale_jobs()]
+
+    assert stale in found
+    assert alive not in found and done not in found
+
+
+@pytest.mark.anyio
+async def test_cleanup_drops_expired_and_orphaned_jobs() -> None:
+    now = datetime.now(timezone.utc)
+    expired = await _insert_job(
+        status="completed", owner_hash="a" * 64, created_at=now - timedelta(days=4)
+    )
+    orphan = await _insert_job(status="completed", created_at=now - timedelta(hours=2))
+    fresh = await _insert_job(status="completed", owner_hash="b" * 64)
+
+    await tasks.delete_expired_jobs()
+
+    assert not await _job_exists(expired)
+    assert not await _job_exists(orphan)
+    assert await _job_exists(fresh)
 
 
 @pytest.mark.anyio

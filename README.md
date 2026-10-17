@@ -10,7 +10,7 @@ final report.
 Live demo: **https://sitepulse.hanyuuu.com**. Press "Run the 12-URL sample" to
 see every result category, including a timeout and two blocked SSRF attempts.
 
-Current version: **0.6.0 — A demo you can poke at**
+Current version: **0.6.1 — A demo you can poke at**
 
 ## Architecture
 
@@ -108,8 +108,29 @@ Only a SHA-256 of the token is stored. Finished jobs are deleted after
 `JOB_RETENTION_HOURS` (72 by default).
 
 `/api/demo/status/{403|404|429|500|503}`, `/api/demo/slow`,
-`/api/demo/redirect` and `/api/demo/redirect-to-metadata` are fixed targets
+`/api/demo/redirect` and `/api/demo/redirect-to-private` are fixed targets
 for the sample job, so it produces the same categories every time.
+
+### Threat model for a public demo without accounts
+
+- **Job links are capabilities.** Anyone holding a job URL can read its
+  results and export them; job IDs are random UUIDv4s (122 bits), so they
+  cannot be guessed or enumerated, and the list endpoint never shows other
+  people's jobs. That is the same model as an unlisted document link.
+- **The owner token is a bearer secret in localStorage.** Any script running
+  on the page could read it, which is why the page loads no third-party code.
+  Losing it (clearing site data) loses control of your jobs, not the data,
+  which expires anyway. Only its SHA-256 is stored server-side.
+- **No CSRF exposure.** Mutations require a custom `X-Owner-Token` header,
+  which a cross-site form or image cannot send, and CORS allows only the
+  local dev origins.
+- **Real auth would change:** owner = user ID from a session, per-user
+  quotas instead of per-IP, and an explicit "share" flag instead of open
+  reads by ID.
+- **The demo targets are deliberately harmless.** `/api/demo/slow` only sleeps
+  (no slot limit to exhaust), and the private-network redirect points at
+  `10.255.255.1`, not at a cloud metadata address, so the domain is not a
+  ready-made SSRF helper.
 
 Interactive API documentation is available at
 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
@@ -159,15 +180,19 @@ curl.exe -X POST http://127.0.0.1:8000/api/checks `
 
 - Celery acknowledges messages only after execution.
 - Lost-worker messages are rejected and become eligible for redelivery.
-- Redis returns an unacknowledged message to the queue once it is older than
-  the visibility timeout (`CELERY_VISIBILITY_TIMEOUT`, 120 s). kombu scans for
-  them about every 100 s, so recovery takes 2 to 4 minutes.
-- PostgreSQL advisory locks allow only one worker to process a job at a time.
-  A duplicate delivery that finds the lock taken retries every 30 s instead
-  of being dropped, so the job survives even if the first worker dies later.
+- The worker writes `heartbeat_at` every 5 s while a job runs. A reaper (Celery
+  beat, every 15 s) requeues any processing job whose heartbeat is older than
+  30 s, keeping the original request ID.
+- PostgreSQL advisory locks allow only one worker to process a job at a time,
+  so a requeue or redelivery while the first worker is alive is skipped.
+- As a backstop, Redis also returns an unacknowledged message to the queue
+  after the visibility timeout (360 s, longer than the longest legitimate
+  job: 200 URLs, 10 at a time, each capped at 15 s).
 - Redelivered jobs process only rows still marked `queued`.
-- The worker writes `heartbeat_at` after every URL. The page shows a notice
-  when a processing job's heartbeat is older than 25 s.
+- Each URL has a 15 s total deadline on top of httpx's per-read timeout, so a
+  server that drips one byte at a time cannot hold a slot.
+- The API reports the heartbeat's age (server clock), and the page shows a
+  notice after 15 s of silence.
 - Transient database and operating-system failures retry with exponential
   backoff; deterministic application failures fail immediately. Individual
   URLs are not retried automatically: a timeout or a 429 is a result, and the
@@ -176,17 +201,20 @@ curl.exe -X POST http://127.0.0.1:8000/api/checks `
 Together these rules provide at-least-once delivery without duplicate progress
 counts and allow a replacement worker to resume after a crash.
 
-Measured on the local Compose stack (visibility timeout set to 40 s), with a
-40-URL job of `httpbin.org/delay/3` links:
+Measured on the local Compose stack with production settings, using a 40-URL
+job of `httpbin.org/delay/3` links:
 
 ```text
-04:59:02  job_processing_started   url_count=40
-04:59:09  docker kill -s KILL sitepulse-worker-1      (20 / 40 saved)
-04:59:10  docker start sitepulse-worker-1
-05:00:42  same Celery task id received again, same request_id
-05:00:42  job_processing_started   url_count=20       (only the queued rows)
-05:00:48  job_completed            successful_urls=40 (no double counting)
+05:12:03  job_processing_started   url_count=40
+05:12:10  docker kill -s KILL sitepulse-worker-1      (20 / 40 saved)
+05:12:10  docker start sitepulse-worker-1
+05:12:41  stale_job_requeued       (heartbeat 30 s old)
+05:12:41  job_processing_started   url_count=20       (only the queued rows)
+05:12:48  job_completed            successful_urls=40 (no double counting)
 ```
+
+Before the reaper, the same test waited for Redis redelivery: 93 s with a
+40 s visibility timeout, and up to an hour with the original setting.
 
 To repeat it: start a job, run `docker kill -s KILL <worker>` and then
 `docker start <worker>`, and grep the worker log for the job's request ID.
@@ -309,11 +337,13 @@ cd frontend
 npm run build
 ```
 
-The current backend baseline is **41 passing tests**, covering CSV parsing,
+The current backend baseline is **45 passing tests**, covering CSV parsing,
 deduplication, API and PostgreSQL integration, idempotency, request IDs,
 rate limiting and client-IP trust, per-browser job ownership, URL and DNS/IP
 SSRF defenses including DNS rebinding and redirects into private ranges,
-worker lock contention and resume-after-crash, size limits, response
+worker lock contention, the stale-job reaper, retention cleanup,
+resume-after-crash, a slow-drip deadline, IPv6 /64 rate-limit buckets, size
+limits, response
 classification, network failures, and HTML title extraction.
 
 GitHub Actions runs:
@@ -347,6 +377,25 @@ automated traffic even when they remain accessible in a browser.
 - Performance benchmarks
 
 ## Version history
+
+### 0.6.1 — 2026-10-17
+
+- Heartbeat every 5 s from a timer, plus a Celery beat reaper that requeues
+  jobs whose heartbeat is 30 s old. Kill-to-resume went from 93 s to 31 s.
+- Visibility timeout raised to 360 s so it exceeds the longest job; duplicate
+  deliveries are skipped by the advisory lock.
+- 15 s total deadline per URL.
+- Jobs store their request ID, so requeued work logs under the same ID.
+- Retention runs on a 10-minute schedule; owner-less jobs go after 1 hour.
+- Blocked and timed-out rows keep the redirect hop, refused target, last IP
+  and elapsed time.
+- Connections fall back to the next validated address (IPv4 first) when one
+  refuses.
+- IPv6 visitors are rate-limited per /64.
+- `/api/system` counts in-flight messages and is cached for 5 s.
+- The demo slow endpoint has no slot cap to exhaust; the private redirect no
+  longer targets the metadata address.
+- Heartbeat age is computed by the server, not the visitor's clock.
 
 ### 0.6.0 — 2026-10-17
 

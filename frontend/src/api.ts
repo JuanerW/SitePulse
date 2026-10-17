@@ -56,8 +56,8 @@ export const SAMPLE_URLS: SampleUrl[] = [
   { url: 'https://sitepulse-demo.invalid', expect: 'network error (no DNS)' },
   { url: 'http://127.0.0.1.nip.io', expect: 'unsafe: DNS answers 127.0.0.1' },
   {
-    url: `${DEMO_ORIGIN}/api/demo/redirect-to-metadata`,
-    expect: 'unsafe: redirects to 169.254.169.254',
+    url: `${DEMO_ORIGIN}/api/demo/redirect-to-private`,
+    expect: 'unsafe: redirects to 10.255.255.1',
   },
 ]
 
