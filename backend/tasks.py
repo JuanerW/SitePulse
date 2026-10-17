@@ -27,6 +27,11 @@ DATABASE_URL = os.getenv(
 )
 configure_logging()
 logger = logging.getLogger("sitepulse.worker")
+LOCK_BUSY_RETRY_SECONDS = 30
+
+
+class JobLockBusy(Exception):
+    """Another worker holds this job's advisory lock right now."""
 
 
 async def process_job(job_id: uuid.UUID) -> None:
@@ -52,8 +57,12 @@ async def process_job(job_id: uuid.UUID) -> None:
                 )
             )
             if not lock_acquired:
-                logger.info("job_skipped_already_running")
-                return
+                # Redis redelivered the message while the first worker is still
+                # running (or its connection is not closed yet). Dropping this
+                # copy would lose the job if that worker then dies, so check
+                # back later instead.
+                logger.info("job_lock_busy")
+                raise JobLockBusy()
 
             query = (
                 select(models.Job)
@@ -73,6 +82,7 @@ async def process_job(job_id: uuid.UUID) -> None:
 
             job.status = "processing"
             job.started_at = job.started_at or datetime.now(timezone.utc)
+            job.heartbeat_at = datetime.now(timezone.utc)
             job.error = None
             await session.commit()
 
@@ -127,6 +137,10 @@ async def process_job(job_id: uuid.UUID) -> None:
                     record.response_time_ms = result.response_time_ms
                     record.title = result.title
                     record.error = result.error
+                    record.final_url = result.final_url
+                    record.remote_ip = result.remote_ip
+                    record.redirect_count = result.redirect_count
+                    job.heartbeat_at = datetime.now(timezone.utc)
 
                     job.completed_urls += 1
                     if result.status == "healthy":
@@ -204,6 +218,14 @@ def check_job(self, job_id: str, request_id: str | None = None) -> None:
         )
         try:
             asyncio.run(process_job(parsed_job_id))
+        except JobLockBusy as exc:
+            # Not a failure: if the other worker finishes, the next attempt
+            # sees a terminal job and stops; if it died, the lock is free.
+            raise self.retry(
+                exc=exc,
+                countdown=LOCK_BUSY_RETRY_SECONDS,
+                max_retries=40,
+            )
         except (DBAPIError, OSError) as exc:
             logger.exception(
                 "celery_task_transient_failure",

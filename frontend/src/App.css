@@ -785,3 +785,284 @@ tbody tr.result-selected {
     backdrop-filter: none;
   }
 }
+
+/* --- 0.6.0: input tabs, sample run, status strip, hood panel, details --- */
+
+.status-dot-down {
+  background: #ef4444;
+  box-shadow: 0 0 0 4px #fee2e2;
+}
+
+.status-version {
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: #edf1f4;
+  color: #62748a;
+  font-size: 12px;
+}
+
+.input-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 10px;
+}
+
+.input-tab {
+  padding: 7px 14px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: #62748a;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.input-tab:hover {
+  color: #0f766e;
+}
+
+.input-tab-active {
+  background: #e6fffa;
+  color: #0f766e;
+}
+
+.url-input {
+  width: 100%;
+  min-width: 0;
+  min-height: 112px;
+  padding: 12px 14px;
+  resize: vertical;
+  border: 1px dashed #b8c7d1;
+  border-radius: 13px;
+  color: #183b56;
+  font: 14px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.url-input:focus {
+  border-color: #0f766e;
+  outline: 2px solid #ccfbf1;
+}
+
+.sample-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  padding: 12px 6px 4px;
+}
+
+.sample-button {
+  padding: 9px 16px;
+  border: 1px solid #0f766e;
+  border-radius: 11px;
+  background: #f0fdfa;
+  color: #0f766e;
+  cursor: pointer;
+  font-weight: 750;
+}
+
+.sample-button:hover:not(:disabled) {
+  background: #ccfbf1;
+}
+
+.sample-button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.sample-help {
+  color: #829ab1;
+  font-size: 13px;
+}
+
+.sample-help a {
+  color: #0f766e;
+}
+
+.worker-note,
+.shared-note {
+  margin: 12px 0 0;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 14px;
+}
+
+.worker-note {
+  color: #9a3412;
+  background: #fff7ed;
+}
+
+.shared-note {
+  color: #475569;
+  background: #f1f5f9;
+}
+
+.hood-card {
+  margin-top: 16px;
+  padding: 14px 20px;
+  border: 1px solid #e0e7ec;
+  border-radius: 15px;
+  background: white;
+}
+
+.hood-card summary {
+  color: #183b56;
+  cursor: pointer;
+  font-weight: 750;
+}
+
+.hood-list {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 14px 18px;
+  margin: 16px 0 4px;
+}
+
+.hood-list dt {
+  color: #62748a;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.hood-list dd {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  color: #475569;
+  font-size: 14px;
+}
+
+.hood-list code,
+.detail-list dd {
+  word-break: break-all;
+}
+
+.hood-list code {
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: #f1f5f9;
+  color: #183b56;
+  font-size: 13px;
+}
+
+.category-bar {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.category-bar .badge {
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.badge-active {
+  border-color: currentColor !important;
+}
+
+.badge-unsafe_target,
+.badge-response_too_large {
+  color: #6b21a8;
+  background: #f3e8ff;
+}
+
+.section-help {
+  margin: 6px 0 0;
+  color: #829ab1;
+  font-size: 13px;
+}
+
+.url-toggle {
+  display: inline-flex;
+  max-width: 100%;
+  gap: 6px;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.url-toggle:hover {
+  color: #0f766e;
+}
+
+.detail-row td {
+  background: #f8fafb;
+}
+
+.detail-list {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 6px 14px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.detail-list dt {
+  color: #62748a;
+  font-weight: 700;
+}
+
+.detail-list dd {
+  margin: 0;
+  color: #183b56;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+@media (max-width: 640px) {
+  .site-header {
+    height: auto;
+    min-height: 72px;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 12px 0;
+  }
+
+  .status {
+    flex-wrap: wrap;
+    font-size: 12px;
+  }
+
+  .hood-list,
+  .detail-list {
+    grid-template-columns: 1fr;
+  }
+}
+
+.hood-card {
+  max-width: 720px;
+  margin: 16px auto 0;
+}
+
+.badge {
+  white-space: nowrap;
+}
+
+.url-cell {
+  max-width: 360px;
+  white-space: normal;
+}
+
+.url-toggle {
+  align-items: baseline;
+  white-space: normal;
+  word-break: break-all;
+}
+
+.title-cell {
+  display: -webkit-box;
+  max-width: 320px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}

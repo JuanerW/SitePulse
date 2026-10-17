@@ -36,6 +36,9 @@ services:
     container_name: sitepulse-api
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Shown in the page header; deploy_sitepulse.sh exports the short SHA.
+      GIT_SHA: ${GIT_SHA:-unknown}
     networks: [default, 1panel-network]
     depends_on:
       migrate:

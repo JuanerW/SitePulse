@@ -19,7 +19,8 @@ DATABASE_URL = os.getenv(
 # The engine manages the connection pool; it is not an individual connection.
 engine = create_async_engine(
     DATABASE_URL,
-    echo=True,  # Log SQL while learning; disable this in production.
+    # SQL logging floods the JSON logs; turn it on locally with SQL_ECHO=1.
+    echo=os.getenv("SQL_ECHO") == "1",
     pool_pre_ping=True,
 )
 

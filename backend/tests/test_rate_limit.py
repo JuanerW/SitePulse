@@ -41,3 +41,25 @@ def test_rate_limit_returns_429(monkeypatch) -> None:
 
     assert response.status_code == 429
     assert "Retry-After" in response.headers
+
+
+def build_ip_app() -> FastAPI:
+    app = FastAPI()
+
+    @app.get("/ip")
+    async def ip(request: Request) -> dict[str, str]:
+        return {"ip": rate_limit.client_ip(request)}
+
+    return app
+
+
+def test_client_ip_trusts_x_real_ip_only_from_private_proxy() -> None:
+    proxied = TestClient(build_ip_app(), client=("172.18.0.5", 50000))
+    assert proxied.get("/ip", headers={"X-Real-IP": "203.0.113.9"}).json() == {
+        "ip": "203.0.113.9"
+    }
+
+    direct = TestClient(build_ip_app(), client=("8.8.8.8", 50000))
+    assert direct.get("/ip", headers={"X-Real-IP": "203.0.113.9"}).json() == {
+        "ip": "8.8.8.8"
+    }

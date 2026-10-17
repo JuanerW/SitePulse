@@ -2,11 +2,15 @@
 
 [![CI](https://github.com/JuanerW/SitePulse/actions/workflows/ci.yml/badge.svg)](https://github.com/JuanerW/SitePulse/actions/workflows/ci.yml)
 
-SitePulse is a full-stack website health monitoring platform. Upload a CSV of
-URLs, process checks asynchronously, follow live progress, inspect actionable
-failure categories, retry selected results, and export the final report.
+SitePulse is a full-stack website health monitoring platform. Paste a list of
+URLs or upload a CSV, process checks asynchronously, follow live progress,
+inspect actionable failure categories, retry selected results, and export the
+final report.
 
-Current version: **0.5.0 — Engineering Quality**
+Live demo: **https://sitepulse.hanyuuu.com**. Press "Run the 12-URL sample" to
+see every result category, including a timeout and two blocked SSRF attempts.
+
+Current version: **0.6.0 — A demo you can poke at**
 
 ## Architecture
 
@@ -43,7 +47,8 @@ Job
 
 ## Product behavior
 
-1. React uploads a CSV to `POST /api/checks`.
+1. React uploads a CSV to `POST /api/checks` (pasted URLs are turned into a
+   CSV in the browser first).
 2. FastAPI validates the file and creates a queued job in PostgreSQL.
 3. FastAPI sends the `job_id` to Redis and immediately returns `202 Accepted`.
 4. A Celery worker reads queued URL rows and checks up to 10 concurrently.
@@ -74,6 +79,8 @@ client_error
 server_error
 timeout
 network_error
+unsafe_target        # private/reserved address, directly, via DNS, or via a redirect
+response_too_large
 queued
 ```
 
@@ -83,14 +90,26 @@ queued
 |---|---|---|
 | `GET` | `/health` | Check the API process |
 | `GET` | `/health/database` | Check PostgreSQL connectivity |
+| `GET` | `/api/system` | Workers online, queue depth, active jobs, version |
 | `POST` | `/api/checks` | Create an asynchronous check job |
-| `GET` | `/api/jobs` | Search and paginate job history |
+| `GET` | `/api/jobs` | Search and paginate the caller's own jobs |
 | `GET` | `/api/jobs/{job_id}` | Read progress and results |
 | `POST` | `/api/jobs/{job_id}/retry-failed` | Retry every non-healthy result |
 | `POST` | `/api/jobs/{job_id}/retry-selected` | Retry selected result IDs |
 | `POST` | `/api/jobs/{job_id}/cancel` | Cancel an active job |
 | `DELETE` | `/api/jobs/{job_id}` | Delete a terminal job and its results |
 | `GET` | `/api/jobs/{job_id}/export` | Export results as CSV |
+
+Every request may carry `X-Owner-Token`, a random value the browser keeps in
+localStorage. There are no accounts: the job list only returns jobs created
+with the caller's token, and retry, cancel and delete return `403` for anyone
+else. `GET /api/jobs/{id}` stays open, so a job link can be shared read-only.
+Only a SHA-256 of the token is stored. Finished jobs are deleted after
+`JOB_RETENTION_HOURS` (72 by default).
+
+`/api/demo/status/{403|404|429|500|503}`, `/api/demo/slow`,
+`/api/demo/redirect` and `/api/demo/redirect-to-metadata` are fixed targets
+for the sample job, so it produces the same categories every time.
 
 Interactive API documentation is available at
 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
@@ -140,14 +159,37 @@ curl.exe -X POST http://127.0.0.1:8000/api/checks `
 
 - Celery acknowledges messages only after execution.
 - Lost-worker messages are rejected and become eligible for redelivery.
-- Redis retains unacknowledged messages for a one-hour visibility window.
+- Redis returns an unacknowledged message to the queue once it is older than
+  the visibility timeout (`CELERY_VISIBILITY_TIMEOUT`, 120 s). kombu scans for
+  them about every 100 s, so recovery takes 2 to 4 minutes.
 - PostgreSQL advisory locks allow only one worker to process a job at a time.
+  A duplicate delivery that finds the lock taken retries every 30 s instead
+  of being dropped, so the job survives even if the first worker dies later.
 - Redelivered jobs process only rows still marked `queued`.
+- The worker writes `heartbeat_at` after every URL. The page shows a notice
+  when a processing job's heartbeat is older than 25 s.
 - Transient database and operating-system failures retry with exponential
-  backoff; deterministic application failures fail immediately.
+  backoff; deterministic application failures fail immediately. Individual
+  URLs are not retried automatically: a timeout or a 429 is a result, and the
+  user decides whether to retry it.
 
 Together these rules provide at-least-once delivery without duplicate progress
 counts and allow a replacement worker to resume after a crash.
+
+Measured on the local Compose stack (visibility timeout set to 40 s), with a
+40-URL job of `httpbin.org/delay/3` links:
+
+```text
+04:59:02  job_processing_started   url_count=40
+04:59:09  docker kill -s KILL sitepulse-worker-1      (20 / 40 saved)
+04:59:10  docker start sitepulse-worker-1
+05:00:42  same Celery task id received again, same request_id
+05:00:42  job_processing_started   url_count=20       (only the queued rows)
+05:00:48  job_completed            successful_urls=40 (no double counting)
+```
+
+To repeat it: start a job, run `docker kill -s KILL <worker>` and then
+`docker start <worker>`, and grep the worker log for the job's request ID.
 
 ## Security and resource controls
 
@@ -161,10 +203,18 @@ counts and allow a replacement worker to resume after a crash.
 - URL credentials are rejected
 - Literal and DNS-resolved private, loopback, link-local, multicast, and
   reserved IPv4/IPv6 destinations are rejected
+- The worker connects to the exact IP it validated (the Host header and TLS
+  SNI keep the original name), so a DNS answer that changes between the check
+  and the connection (DNS rebinding) cannot reach a private address
 - Every redirect target is validated and resolved again before following it
+- Create and retry are rate-limited separately; a job can be retried 5 times
 
 The rate limiter is stored in Redis and returns `429` with `Retry-After`.
-Limits are configurable through environment variables.
+Limits are configurable through environment variables. It keys on the real
+visitor address: the frontend nginx trusts `X-Real-IP` only from private
+addresses (the host's edge proxy), and the API trusts it only from the nginx
+container. An idempotent replay is answered before the limiter and costs
+nothing.
 
 ## Local development
 
@@ -259,9 +309,11 @@ cd frontend
 npm run build
 ```
 
-The current backend baseline is **31 passing tests**, covering CSV parsing,
+The current backend baseline is **41 passing tests**, covering CSV parsing,
 deduplication, API and PostgreSQL integration, idempotency, request IDs,
-rate limiting, URL and DNS/IP SSRF defenses, size limits, response
+rate limiting and client-IP trust, per-browser job ownership, URL and DNS/IP
+SSRF defenses including DNS rebinding and redirects into private ranges,
+worker lock contention and resume-after-crash, size limits, response
 classification, network failures, and HTML title extraction.
 
 GitHub Actions runs:
@@ -291,11 +343,40 @@ automated traffic even when they remain accessible in a browser.
 
 ## Roadmap
 
-- Public deployment and performance benchmarks
-- Authentication and per-user job isolation
 - SSE or WebSocket progress updates
+- Performance benchmarks
 
 ## Version history
+
+### 0.6.0 — 2026-10-17
+
+Added:
+
+- A paste box and a one-click 12-URL sample that hits every result category,
+  plus a downloadable sample CSV.
+- Fixed demo targets under `/api/demo/` for that sample.
+- Per-browser job ownership via `X-Owner-Token`: history, retry, cancel and
+  delete are private, and job links can be shared read-only.
+- 72-hour retention for finished jobs.
+- An `unsafe_target` category; SSRF rejections no longer look like job failures.
+- Connections pinned to the validated IP (DNS-rebinding fix).
+- Final URL, connected IP and redirect count per result, shown in an
+  expandable row and in the CSV export.
+- `heartbeat_at` on jobs and a "worker went quiet" notice on the page.
+- `/api/system` and a live status strip (workers, queue depth, version).
+- An "Under the hood" panel: request ID, Idempotency-Key with a replay
+  button, and the remaining rate-limit quota.
+- p50/p95 response times and clickable category counts.
+- Ten tests, bringing the backend baseline to 41.
+
+Changed:
+
+- The rate limit keys on the real visitor IP instead of the proxy's.
+- Retries are rate-limited and capped at 5 per job.
+- Idempotent replays are answered before the rate limiter.
+- The visibility timeout went from 3600 s to 120 s; a duplicate delivery that
+  finds the job locked retries later instead of being dropped.
+- SQL echo is off unless `SQL_ECHO=1`.
 
 ### 0.5.0 — 2026-07-28
 
@@ -371,8 +452,10 @@ Changed:
 ## Current limitations
 
 - The dashboard polls instead of using SSE or WebSockets.
+- Ownership is a browser token, not an account: clearing site data loses
+  access to your jobs (they still expire on schedule).
 - Progress is committed once per URL; larger workloads should batch writes.
 - DNS targets are validated immediately before each request, but hardened
   production deployments should also enforce outbound network policy.
 - Future schema changes must be added as Alembic revisions.
-- Rate limiting is IP-based; authenticated deployments should add per-user quotas.
+- Rate limiting is IP-based; visitors behind one NAT share a quota.

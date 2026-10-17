@@ -25,6 +25,11 @@ class Job(Base):
     request_fingerprint: Mapped[str | None] = mapped_column(
         String(64), nullable=True
     )
+    # SHA-256 of the browser's owner token. Only the hash is stored, so the
+    # database alone cannot be used to act as a visitor.
+    owner_hash: Mapped[str | None] = mapped_column(
+        String(64), index=True, nullable=True
+    )
     status: Mapped[str] = mapped_column(String(20), default="queued")
     total_urls: Mapped[int] = mapped_column(Integer)
     completed_urls: Mapped[int] = mapped_column(
@@ -54,6 +59,17 @@ class Job(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    # Updated by the worker after every URL; a processing job whose heartbeat
+    # stops moving has lost its worker and is waiting for redelivery.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    retry_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default=text("0"),
+    )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     results: Mapped[list["CheckResultRecord"]] = relationship(
@@ -78,5 +94,12 @@ class CheckResultRecord(Base):
     response_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     title: Mapped[str | None] = mapped_column(String(200), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    final_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remote_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    redirect_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default=text("0"),
+    )
 
     job: Mapped[Job] = relationship(back_populates="results")

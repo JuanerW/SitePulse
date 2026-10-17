@@ -1,11 +1,13 @@
+import asyncio
 import csv
 import hashlib
 import io
 import logging
 import math
+import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from fastapi import (
     Depends,
@@ -13,14 +15,17 @@ from fastapi import (
     File,
     Header,
     HTTPException,
+    Path as PathParam,
     Query,
+    Request,
+    Response,
     UploadFile,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -34,12 +39,21 @@ from observability import (
     configure_logging,
     current_request_id,
 )
-from rate_limit import enforce_create_job_rate_limit
+from celery_app import celery_app
+from rate_limit import (
+    enforce_create_job_rate_limit,
+    enforce_retry_rate_limit,
+    redis_client,
+)
 
 
 MAX_URLS = 200
 MAX_UPLOAD_BYTES = 1_000_000
 MAX_URL_LENGTH = 2048
+MAX_RETRIES_PER_JOB = 5
+JOB_RETENTION_HOURS = int(os.getenv("JOB_RETENTION_HOURS", "72"))
+APP_VERSION = "0.6.0"
+GIT_SHA = os.getenv("GIT_SHA", "dev")
 configure_logging()
 logger = logging.getLogger("sitepulse.api")
 
@@ -60,7 +74,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="SitePulse API",
     description="Upload a CSV of URLs and check website status in the background.",
-    version="0.4.1",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 app.add_middleware(RequestContextMiddleware)
@@ -72,6 +86,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After"],
 )
 
 
@@ -85,6 +100,9 @@ class CheckResult(BaseModel):
     response_time_ms: int | None = None
     title: str | None = None
     error: str | None = None
+    final_url: str | None = None
+    remote_ip: str | None = None
+    redirect_count: int = 0
 
 
 class JobAccepted(BaseModel):
@@ -93,6 +111,7 @@ class JobAccepted(BaseModel):
     job_id: uuid.UUID
     status: str
     total_urls: int
+    replayed: bool = False
 
 
 class JobSummary(BaseModel):
@@ -129,6 +148,13 @@ class JobDetail(BaseModel):
     successful: int
     failed: int
     error: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    retry_count: int = 0
+    # Whether the caller's owner token matches; only owners see job actions.
+    is_owner: bool = False
     results: list[CheckResult]
 
 
@@ -144,6 +170,42 @@ class RetrySelectedRequest(BaseModel):
     """The result row IDs that the user explicitly selected to retry."""
 
     result_ids: list[int] = Field(min_length=1, max_length=MAX_URLS)
+
+
+def owner_hash_from(token: str | None) -> str | None:
+    """
+    Hash the browser's random owner token.
+
+    There are no accounts. Each browser keeps a random token in localStorage
+    and sends it as X-Owner-Token; a job belongs to whoever created it. Job
+    IDs are random UUIDs, so a job link can still be shared read-only.
+    """
+
+    if not token or not 16 <= len(token.strip()) <= 128:
+        return None
+    return hashlib.sha256(token.strip().encode()).hexdigest()
+
+
+def require_owner(job: models.Job, owner_hash: str | None) -> None:
+    if owner_hash is None or job.owner_hash != owner_hash:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the browser that started this job can change it",
+        )
+
+
+async def delete_expired_jobs(db: AsyncSession) -> None:
+    """Keep the public demo small: drop finished jobs past the retention window."""
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=JOB_RETENTION_HOURS)
+    result = await db.execute(
+        delete(models.Job).where(
+            models.Job.created_at < cutoff,
+            models.Job.status.in_(["completed", "failed", "cancelled"]),
+        )
+    )
+    if result.rowcount:
+        logger.info("expired_jobs_deleted", extra={"job_count": result.rowcount})
 
 
 def read_urls_from_csv(content: bytes) -> list[str]:
@@ -198,7 +260,7 @@ def read_urls_from_csv(content: bytes) -> list[str]:
 async def health_check() -> dict[str, str]:
     """Confirm that the FastAPI process is responding."""
 
-    return {"status": "healthy"}
+    return {"status": "healthy", "version": APP_VERSION, "commit": GIT_SHA}
 
 
 @app.get("/health/database")
@@ -211,19 +273,67 @@ async def database_health_check() -> dict[str, str]:
     return {"status": "healthy", "database": str(database_name)}
 
 
+_worker_cache: dict[str, float | int] = {"checked_at": 0.0, "workers": 0}
+
+
+async def count_workers() -> int:
+    """Ping Celery workers at most every 10 s; the page polls this endpoint."""
+
+    loop = asyncio.get_running_loop()
+    if loop.time() - _worker_cache["checked_at"] > 10:
+        try:
+            replies = await loop.run_in_executor(
+                None, lambda: celery_app.control.ping(timeout=0.5)
+            )
+            _worker_cache["workers"] = len(replies or [])
+        except Exception:
+            logger.exception("worker_ping_failed")
+            _worker_cache["workers"] = 0
+        _worker_cache["checked_at"] = loop.time()
+    return int(_worker_cache["workers"])
+
+
+@app.get("/api/system")
+async def system_status(db: AsyncSession = Depends(get_db)) -> dict[str, object]:
+    """Live numbers for the status strip: workers, queue depth, active jobs."""
+
+    try:
+        queue_depth = int(await redis_client.llen("celery"))
+    except Exception:
+        queue_depth = -1
+    active_jobs = int(
+        await db.scalar(
+            select(func.count(models.Job.id)).where(
+                models.Job.status.in_(["queued", "processing"])
+            )
+        )
+        or 0
+    )
+    return {
+        "version": APP_VERSION,
+        "commit": GIT_SHA,
+        "workers": await count_workers(),
+        "queue_depth": queue_depth,
+        "active_jobs": active_jobs,
+        "retention_hours": JOB_RETENTION_HOURS,
+    }
+
+
 @app.post(
     "/api/checks",
     response_model=JobAccepted,
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def create_check_job(
-    _: None = Depends(enforce_create_job_rate_limit),
+    request: Request,
+    response: Response,
     file: UploadFile = File(...),
     idempotency_key: str | None = Header(
         default=None,
         alias="Idempotency-Key",
         max_length=128,
     ),
+    owner_token: str | None = Header(default=None, alias="X-Owner-Token"),
     db: AsyncSession = Depends(get_db),
 ) -> JobAccepted:
     """
@@ -246,6 +356,7 @@ async def create_check_job(
         )
 
     fingerprint = hashlib.sha256(content).hexdigest()
+    owner_hash = owner_hash_from(owner_token)
     normalized_key = idempotency_key.strip() if idempotency_key else None
     if normalized_key:
         existing_job = await db.scalar(
@@ -254,11 +365,16 @@ async def create_check_job(
             )
         )
         if existing_job:
-            if existing_job.request_fingerprint != fingerprint:
+            if (
+                existing_job.request_fingerprint != fingerprint
+                or existing_job.owner_hash != owner_hash
+            ):
                 raise HTTPException(
                     status_code=409,
-                    detail="Idempotency-Key was already used for a different file",
+                    detail="Idempotency-Key was already used for a different request",
                 )
+            # A replay creates no work, so it is answered before the rate
+            # limiter and does not spend the caller's quota.
             logger.info(
                 "idempotent_job_reused",
                 extra={"job_id": str(existing_job.id)},
@@ -267,13 +383,17 @@ async def create_check_job(
                 job_id=existing_job.id,
                 status=existing_job.status,
                 total_urls=existing_job.total_urls,
+                replayed=True,
             )
 
+    await enforce_create_job_rate_limit(request, response)
     urls = read_urls_from_csv(content)
+    await delete_expired_jobs(db)
     job = models.Job(
         filename=file.filename,
         idempotency_key=normalized_key,
         request_fingerprint=fingerprint if normalized_key else None,
+        owner_hash=owner_hash,
         status="queued",
         total_urls=len(urls),
         completed_urls=0,
@@ -301,15 +421,17 @@ async def create_check_job(
         if (
             existing_job is None
             or existing_job.request_fingerprint != fingerprint
+            or existing_job.owner_hash != owner_hash
         ):
             raise HTTPException(
                 status_code=409,
-                detail="Idempotency-Key was already used for a different file",
+                detail="Idempotency-Key was already used for a different request",
             )
         return JobAccepted(
             job_id=existing_job.id,
             status=existing_job.status,
             total_urls=existing_job.total_urls,
+            replayed=True,
         )
     await db.refresh(job)
 
@@ -343,11 +465,15 @@ async def list_jobs(
     page_size: int = Query(default=8, ge=1, le=50),
     job_status: str | None = Query(default=None, alias="status"),
     query_text: str | None = Query(default=None, alias="q", max_length=100),
+    owner_token: str | None = Header(default=None, alias="X-Owner-Token"),
     db: AsyncSession = Depends(get_db),
 ) -> JobPage:
-    """Filter job history by status and filename and return a page of results."""
+    """Return a page of the caller's own jobs, filtered by status and filename."""
 
-    filters = []
+    owner_hash = owner_hash_from(owner_token)
+    if owner_hash is None:
+        return JobPage(items=[], total=0, page=page, page_size=page_size, pages=1)
+    filters = [models.Job.owner_hash == owner_hash]
     if job_status:
         filters.append(models.Job.status == job_status)
     if query_text:
@@ -389,6 +515,7 @@ async def list_jobs(
 @app.get("/api/jobs/{job_id}", response_model=JobDetail)
 async def get_job(
     job_id: uuid.UUID,
+    owner_token: str | None = Header(default=None, alias="X-Owner-Token"),
     db: AsyncSession = Depends(get_db),
 ) -> JobDetail:
     """Read job status, live progress, and completed results."""
@@ -412,6 +539,15 @@ async def get_job(
         successful=job.successful_urls,
         failed=job.failed_urls,
         error=job.error,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        heartbeat_at=job.heartbeat_at,
+        retry_count=job.retry_count,
+        is_owner=(
+            job.owner_hash is not None
+            and job.owner_hash == owner_hash_from(owner_token)
+        ),
         results=[
             CheckResult(
                 id=result.id,
@@ -421,8 +557,11 @@ async def get_job(
                 response_time_ms=result.response_time_ms,
                 title=result.title,
                 error=result.error,
+                final_url=result.final_url,
+                remote_ip=result.remote_ip,
+                redirect_count=result.redirect_count,
             )
-            for result in job.results
+            for result in sorted(job.results, key=lambda result: result.id)
         ],
     )
 
@@ -433,6 +572,8 @@ async def get_job(
 )
 async def retry_failed_results(
     job_id: uuid.UUID,
+    _: None = Depends(enforce_retry_rate_limit),
+    owner_token: str | None = Header(default=None, alias="X-Owner-Token"),
     db: AsyncSession = Depends(get_db),
 ) -> ActionResponse:
     """Reset non-healthy URLs to queued and enqueue the same job again."""
@@ -446,8 +587,14 @@ async def retry_failed_results(
 
     if job is None:
         raise HTTPException(status_code=404, detail="Check job not found")
+    require_owner(job, owner_hash_from(owner_token))
     if job.status not in {"completed", "failed", "cancelled"}:
         raise HTTPException(status_code=409, detail="A running job cannot be retried")
+    if job.retry_count >= MAX_RETRIES_PER_JOB:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A job can be retried at most {MAX_RETRIES_PER_JOB} times",
+        )
 
     retry_records = [
         result
@@ -467,8 +614,12 @@ async def retry_failed_results(
         result.response_time_ms = None
         result.title = None
         result.error = None
+        result.final_url = None
+        result.remote_ip = None
+        result.redirect_count = 0
 
     job.status = "queued"
+    job.retry_count += 1
     job.completed_urls -= previously_completed
     job.failed_urls = 0
     job.finished_at = None
@@ -501,6 +652,8 @@ async def retry_failed_results(
 async def retry_selected_results(
     job_id: uuid.UUID,
     request: RetrySelectedRequest,
+    _: None = Depends(enforce_retry_rate_limit),
+    owner_token: str | None = Header(default=None, alias="X-Owner-Token"),
     db: AsyncSession = Depends(get_db),
 ) -> ActionResponse:
     """Retry only the non-healthy result rows explicitly selected by the user."""
@@ -514,8 +667,14 @@ async def retry_selected_results(
 
     if job is None:
         raise HTTPException(status_code=404, detail="Check job not found")
+    require_owner(job, owner_hash_from(owner_token))
     if job.status not in {"completed", "failed", "cancelled"}:
         raise HTTPException(status_code=409, detail="A running job cannot be retried")
+    if job.retry_count >= MAX_RETRIES_PER_JOB:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A job can be retried at most {MAX_RETRIES_PER_JOB} times",
+        )
 
     # Every ID must belong to this job. Silently ignoring an invalid ID would
     # make the selection shown in the frontend disagree with the actual retry.
@@ -548,9 +707,13 @@ async def retry_selected_results(
         result.response_time_ms = None
         result.title = None
         result.error = None
+        result.final_url = None
+        result.remote_ip = None
+        result.redirect_count = 0
 
     retry_count = len(retry_records)
     job.status = "queued"
+    job.retry_count += 1
     job.completed_urls = max(0, job.completed_urls - retry_count)
     job.failed_urls = max(0, job.failed_urls - retry_count)
     job.finished_at = None
@@ -579,6 +742,7 @@ async def retry_selected_results(
 @app.post("/api/jobs/{job_id}/cancel", response_model=ActionResponse)
 async def cancel_job(
     job_id: uuid.UUID,
+    owner_token: str | None = Header(default=None, alias="X-Owner-Token"),
     db: AsyncSession = Depends(get_db),
 ) -> ActionResponse:
     """Cancel a queued or processing job; workers stop at safe checkpoints."""
@@ -586,6 +750,7 @@ async def cancel_job(
     job = await db.get(models.Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Check job not found")
+    require_owner(job, owner_hash_from(owner_token))
     if job.status not in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="Only queued or processing jobs can be cancelled")
 
@@ -603,6 +768,7 @@ async def cancel_job(
 @app.delete("/api/jobs/{job_id}", response_model=ActionResponse)
 async def delete_job(
     job_id: uuid.UUID,
+    owner_token: str | None = Header(default=None, alias="X-Owner-Token"),
     db: AsyncSession = Depends(get_db),
 ) -> ActionResponse:
     """Delete a terminal job and all its results. Running jobs must be cancelled first."""
@@ -610,6 +776,7 @@ async def delete_job(
     job = await db.get(models.Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Check job not found")
+    require_owner(job, owner_hash_from(owner_token))
     if job.status in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="Cancel the running job first")
 
@@ -649,9 +816,12 @@ async def export_job_csv(
             "response_time_ms",
             "title",
             "error",
+            "final_url",
+            "remote_ip",
+            "redirect_count",
         ]
     )
-    for result in job.results:
+    for result in sorted(job.results, key=lambda result: result.id):
         writer.writerow(
             [
                 result.url,
@@ -660,6 +830,9 @@ async def export_job_csv(
                 result.response_time_ms or "",
                 result.title or "",
                 result.error or "",
+                result.final_url or "",
+                result.remote_ip or "",
+                result.redirect_count,
             ]
         )
 
@@ -671,3 +844,41 @@ async def export_job_csv(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# Deterministic targets for the one-click sample job. The sample checks these
+# through the public hostname, so each result category shows up every time
+# without depending on third-party sites misbehaving on cue.
+DEMO_STATUS_CODES = {200, 403, 404, 429, 500, 503}
+DEMO_SLOW_SECONDS = 12  # longer than the checker's 8 s timeout
+demo_slow_slots = asyncio.Semaphore(20)
+
+
+@app.get("/api/demo/status/{code}", include_in_schema=False)
+async def demo_status(code: int = PathParam(...)) -> PlainTextResponse:
+    if code not in DEMO_STATUS_CODES:
+        raise HTTPException(status_code=404, detail="Unknown demo status")
+    headers = {"Retry-After": "30"} if code == 429 else None
+    return PlainTextResponse(f"SitePulse demo: HTTP {code}", status_code=code, headers=headers)
+
+
+@app.get("/api/demo/slow", include_in_schema=False)
+async def demo_slow() -> PlainTextResponse:
+    # Bounded so the endpoint cannot be used to pin open API connections.
+    if demo_slow_slots.locked():
+        raise HTTPException(status_code=503, detail="Demo endpoint busy")
+    async with demo_slow_slots:
+        await asyncio.sleep(DEMO_SLOW_SECONDS)
+    return PlainTextResponse("SitePulse demo: slow response")
+
+
+@app.get("/api/demo/redirect", include_in_schema=False)
+async def demo_redirect() -> RedirectResponse:
+    return RedirectResponse("/api/demo/status/200", status_code=301)
+
+
+@app.get("/api/demo/redirect-to-metadata", include_in_schema=False)
+async def demo_redirect_to_metadata() -> RedirectResponse:
+    # A public URL that redirects into the cloud metadata range. The checker
+    # must refuse the second hop.
+    return RedirectResponse("http://169.254.169.254/latest/meta-data/", status_code=302)

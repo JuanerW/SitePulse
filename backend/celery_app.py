@@ -25,7 +25,15 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     # Docker startup order is not guaranteed, so workers keep waiting for Redis.
     broker_connection_retry_on_startup=True,
-    broker_transport_options={"visibility_timeout": 3600},
+    # An unacknowledged message from a worker that died without saying so
+    # (SIGKILL, OOM, host reboot) goes back to the queue once it is older than
+    # this. kombu only scans for such messages every ~100 s, so recovery takes
+    # between this and this + 100 s. A big job (200 URLs, 10 at a time, 8 s
+    # timeout) can outlive the window; its duplicate delivery then finds the
+    # advisory lock taken and checks back every 30 s instead of running twice.
+    broker_transport_options={
+        "visibility_timeout": int(os.getenv("CELERY_VISIBILITY_TIMEOUT", "120")),
+    },
     worker_hijack_root_logger=False,
     timezone="UTC",
 )
