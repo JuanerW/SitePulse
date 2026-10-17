@@ -52,7 +52,7 @@ MAX_UPLOAD_BYTES = 1_000_000
 MAX_URL_LENGTH = 2048
 MAX_RETRIES_PER_JOB = 5
 JOB_RETENTION_HOURS = int(os.getenv("JOB_RETENTION_HOURS", "72"))
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.6.2"
 GIT_SHA = os.getenv("GIT_SHA", "dev")
 configure_logging()
 logger = logging.getLogger("sitepulse.api")

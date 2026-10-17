@@ -1,7 +1,9 @@
 # Production compose for the Oracle host (sitepulse.hanyuuu.com).
-# PostgreSQL is the 1Panel-managed container on `1panel-network`; Redis stays
-# private to this stack; only the frontend (nginx, proxies /api → api) is
-# published, on loopback, for OpenResty to reverse-proxy.
+# PostgreSQL and Redis are the 1Panel-managed containers on `1panel-network`
+# (REDIS_URL in .env points at Redis database 1, with its password); only the
+# frontend (nginx, proxies /api → api) is published, on loopback, for
+# OpenResty to reverse-proxy. The local docker-compose.yml still runs its own
+# Redis so the project starts with one command anywhere.
 #
 # Secrets live in a gitignored .env next to this file (see backend/.env.example
 # for the expected keys) — nothing in this compose file is a credential.
@@ -9,19 +11,6 @@
 #   sudo docker compose -f docker-compose.prod.yml up -d --build
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: sitepulse-redis
-    restart: unless-stopped
-    command: redis-server --appendonly yes
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   migrate:
     build: ./backend
     image: sitepulse-backend:latest
@@ -43,8 +32,6 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      redis:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -61,8 +48,6 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-      redis:
-        condition: service_healthy
 
   frontend:
     build:
@@ -81,6 +66,3 @@ services:
 networks:
   1panel-network:
     external: true
-
-volumes:
-  redis_data:

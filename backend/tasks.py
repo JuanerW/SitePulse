@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import and_, delete, or_, select, text, update
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
@@ -30,6 +30,7 @@ logger = logging.getLogger("sitepulse.worker")
 HEARTBEAT_SECONDS = 5
 # A processing job whose heartbeat is older than this has lost its worker.
 STALE_AFTER_SECONDS = 30
+QUEUED_STALE_AFTER_SECONDS = 60
 JOB_RETENTION_HOURS = int(os.getenv("JOB_RETENTION_HOURS", "72"))
 # Jobs created without an owner token (plain curl, or rows from before
 # ownership existed) cannot be managed by anyone, so they go sooner.
@@ -266,21 +267,41 @@ def check_job(self, job_id: str, request_id: str | None = None) -> None:
 
 
 async def requeue_stale_jobs() -> list[tuple[uuid.UUID, str | None]]:
-    """Find processing jobs whose worker stopped sending heartbeats."""
+    """
+    Find jobs whose Redis message may be gone.
+
+    - processing, heartbeat older than 30 s: the worker died mid-run.
+    - queued, untouched for 60 s: the message never reached a worker, for
+      example because Redis restarted before its last snapshot. PostgreSQL
+      is the source of truth, so the job can always be queued again.
+    """
 
     engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=STALE_AFTER_SECONDS)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=STALE_AFTER_SECONDS)
+    queued_cutoff = now - timedelta(seconds=QUEUED_STALE_AFTER_SECONDS)
     try:
         async with session_factory() as session:
             stale = (
                 await session.execute(
                     select(models.Job.id, models.Job.request_id).where(
-                        models.Job.status == "processing",
                         or_(
-                            models.Job.heartbeat_at.is_(None),
-                            models.Job.heartbeat_at < cutoff,
-                        ),
+                            and_(
+                                models.Job.status == "processing",
+                                or_(
+                                    models.Job.heartbeat_at.is_(None),
+                                    models.Job.heartbeat_at < cutoff,
+                                ),
+                            ),
+                            and_(
+                                models.Job.status == "queued",
+                                func.coalesce(
+                                    models.Job.heartbeat_at, models.Job.created_at
+                                )
+                                < queued_cutoff,
+                            ),
+                        )
                     )
                 )
             ).all()

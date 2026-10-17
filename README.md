@@ -10,7 +10,7 @@ final report.
 Live demo: **https://sitepulse.hanyuuu.com**. Press "Run the 12-URL sample" to
 see every result category, including a timeout and two blocked SSRF attempts.
 
-Current version: **0.6.1 — A demo you can poke at**
+Current version: **0.6.2 — A demo you can poke at**
 
 ## Architecture
 
@@ -182,7 +182,9 @@ curl.exe -X POST http://127.0.0.1:8000/api/checks `
 - Lost-worker messages are rejected and become eligible for redelivery.
 - The worker writes `heartbeat_at` every 5 s while a job runs. A reaper (Celery
   beat, every 15 s) requeues any processing job whose heartbeat is older than
-  30 s, keeping the original request ID.
+  30 s, keeping the original request ID. It also requeues jobs left
+  `queued` for 60 s, which covers a Redis restart that lost messages:
+  PostgreSQL is the source of truth, Redis only carries job IDs.
 - PostgreSQL advisory locks allow only one worker to process a job at a time,
   so a requeue or redelivery while the first worker is alive is skipped.
 - As a backstop, Redis also returns an unacknowledged message to the queue
@@ -382,6 +384,13 @@ automated traffic even when they remain accessible in a browser.
 - Performance benchmarks
 
 ## Version history
+
+### 0.6.2 — 2026-10-17
+
+- Production uses the host's shared 1Panel Redis (database 1) instead of a
+  Redis container inside this stack; local Compose still bundles its own.
+- The reaper also requeues jobs stuck in `queued` for 60 s, so losing Redis
+  data loses no work.
 
 ### 0.6.1 — 2026-10-17
 

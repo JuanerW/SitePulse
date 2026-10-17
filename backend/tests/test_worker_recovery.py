@@ -68,6 +68,12 @@ async def test_reaper_finds_processing_jobs_with_a_stale_heartbeat() -> None:
 
     assert stale in found
     assert alive not in found and done not in found
+    lost = await _insert_job(status="queued", created_at=now - timedelta(minutes=5))
+    waiting = await _insert_job(status="queued")
+    found_queued = [job_id for job_id, _ in await tasks.requeue_stale_jobs()]
+    # A queued job nobody picked up for minutes lost its Redis message.
+    assert lost in found_queued and waiting not in found_queued
+
     # The requeue counts as a heartbeat: the next pass leaves it alone.
     again = [job_id for job_id, _ in await tasks.requeue_stale_jobs()]
     assert stale not in again
