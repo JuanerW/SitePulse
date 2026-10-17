@@ -219,6 +219,11 @@ Before the reaper, the same test waited for Redis redelivery: 93 s with a
 To repeat it: start a job, run `docker kill -s KILL <worker>` and then
 `docker start <worker>`, and grep the worker log for the job's request ID.
 
+The demo runs one worker container with the beat scheduler inside it
+(`worker -B`), so recovery happens when that container comes back. With two or
+more workers and a separate beat process, a surviving worker would pick the
+job up without any restart.
+
 ## Security and resource controls
 
 - CSV upload size: 1 MB
@@ -337,7 +342,7 @@ cd frontend
 npm run build
 ```
 
-The current backend baseline is **45 passing tests**, covering CSV parsing,
+The current backend baseline is **46 passing tests**, covering CSV parsing,
 deduplication, API and PostgreSQL integration, idempotency, request IDs,
 rate limiting and client-IP trust, per-browser job ownership, URL and DNS/IP
 SSRF defenses including DNS rebinding and redirects into private ranges,
@@ -396,6 +401,9 @@ automated traffic even when they remain accessible in a browser.
 - The demo slow endpoint has no slot cap to exhaust; the private redirect no
   longer targets the metadata address.
 - Heartbeat age is computed by the server, not the visitor's clock.
+- A requeue counts as a heartbeat, so a waiting job is not requeued every
+  15 s; a failed heartbeat write is logged instead of stopping the loop.
+- Timeout rows keep the address the worker was connected to.
 
 ### 0.6.0 — 2026-10-17
 

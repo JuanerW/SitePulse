@@ -46,13 +46,18 @@ async def beat_heartbeat(session_factory: async_sessionmaker, job_id: uuid.UUID)
     """
 
     while True:
-        async with session_factory() as session:
-            await session.execute(
-                update(models.Job)
-                .where(models.Job.id == job_id)
-                .values(heartbeat_at=datetime.now(timezone.utc))
-            )
-            await session.commit()
+        try:
+            async with session_factory() as session:
+                await session.execute(
+                    update(models.Job)
+                    .where(models.Job.id == job_id)
+                    .values(heartbeat_at=datetime.now(timezone.utc))
+                )
+                await session.commit()
+        except Exception:
+            # One failed write must not end the loop; a missing heartbeat
+            # would make a healthy job look dead and get it requeued.
+            logger.exception("heartbeat_write_failed")
         await asyncio.sleep(HEARTBEAT_SECONDS)
 
 
@@ -279,6 +284,16 @@ async def requeue_stale_jobs() -> list[tuple[uuid.UUID, str | None]]:
                     )
                 )
             ).all()
+            if stale:
+                # Count the requeue as a heartbeat, so a job waiting behind busy
+                # workers is requeued at most once per stale window, not on
+                # every 15 s reaper pass.
+                await session.execute(
+                    update(models.Job)
+                    .where(models.Job.id.in_([row.id for row in stale]))
+                    .values(heartbeat_at=datetime.now(timezone.utc))
+                )
+                await session.commit()
             return [(row.id, row.request_id) for row in stale]
     finally:
         await engine.dispose()

@@ -262,3 +262,17 @@ async def test_total_deadline_stops_a_slow_drip(monkeypatch: pytest.MonkeyPatch)
     assert result.status == "timeout"
     assert result.remote_ip == "93.184.216.34"
     assert result.response_time_ms is not None and result.response_time_ms >= 300
+
+
+@pytest.mark.anyio
+async def test_timeout_before_headers_still_reports_the_address() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("no headers", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await check_one_website(
+            client, asyncio.Semaphore(1), "https://example.com/slow"
+        )
+
+    assert result.status == "timeout"
+    assert result.remote_ip == "93.184.216.34"

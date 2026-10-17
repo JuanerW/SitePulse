@@ -776,7 +776,9 @@ function App() {
             No list handy? Run the {SAMPLE_URLS.length}-URL sample
           </button>
           <span className="sample-help">
-            Covers every category, including a timeout and two SSRF attempts.{' '}
+            Covers every category, including a timeout and two SSRF attempts.
+            Seven targets are SitePulse&apos;s own test endpoints, so each category
+            shows up on every run.{' '}
             <a href={sampleCsvHref} download="sitepulse-sample.csv">
               Download it as CSV
             </a>

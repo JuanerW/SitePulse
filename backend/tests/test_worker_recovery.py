@@ -68,6 +68,9 @@ async def test_reaper_finds_processing_jobs_with_a_stale_heartbeat() -> None:
 
     assert stale in found
     assert alive not in found and done not in found
+    # The requeue counts as a heartbeat: the next pass leaves it alone.
+    again = [job_id for job_id, _ in await tasks.requeue_stale_jobs()]
+    assert stale not in again
 
 
 @pytest.mark.anyio

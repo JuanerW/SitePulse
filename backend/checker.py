@@ -160,6 +160,7 @@ async def pinned_stream(
     client: httpx.AsyncClient,
     url: str,
     addresses: list[str],
+    attempted: list[str] | None = None,
 ) -> AsyncIterator[tuple[str, httpx.Response]]:
     """
     Stream a GET from the first validated address that accepts a connection.
@@ -173,6 +174,10 @@ async def pinned_stream(
     ordered = sorted(addresses, key=lambda address: ":" in address)
     last_error: httpx.ConnectError | None = None
     for address in ordered:
+        if attempted is not None:
+            # Recorded before sending, so a timeout waiting for headers still
+            # reports which address it was talking to.
+            attempted.append(address)
         target, headers, extensions = pinned_request(url, address)
         request = client.build_request(
             "GET", target, headers=headers, extensions=extensions
@@ -209,6 +214,7 @@ async def check_one_website(
     current_url = url
     remote_ip: str | None = None
     redirect_count = 0
+    attempted: list[str] = []
     started_at = time.perf_counter()
 
     def outcome(status: str, error: str | None = None, **fields: object) -> WebsiteCheck:
@@ -236,7 +242,9 @@ async def check_one_website(
             async with asyncio.timeout(TOTAL_DEADLINE_SECONDS):
                 for redirect_number in range(MAX_REDIRECTS + 1):
                     addresses = await resolve_public_addresses(current_url)
-                    async with pinned_stream(client, current_url, addresses) as (
+                    async with pinned_stream(
+                        client, current_url, addresses, attempted
+                    ) as (
                         connected_ip,
                         streamed_response,
                     ):
@@ -292,6 +300,7 @@ async def check_one_website(
             title=parser.title,
         )
     except (httpx.TimeoutException, TimeoutError):
+        remote_ip = remote_ip or (attempted[-1] if attempted else None)
         return outcome(
             "timeout",
             f"No complete answer after {elapsed_ms() / 1000:.1f} s",
